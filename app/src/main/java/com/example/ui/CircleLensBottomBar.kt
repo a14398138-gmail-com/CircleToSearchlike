@@ -48,7 +48,7 @@ fun CircleLensBottomBar(
     onSelectAllText: () -> Unit,
     onShareEntireScreenGeneral: () -> Unit,
     onShareEntireScreenDirect: (ShareTarget) -> Unit,
-    onOpenAllTargetsPicker: () -> Unit = {}
+    onOpenShareSheet: () -> Unit = {}
 ) {
     // State for showing recent apps vertical slider
     var showRecentSlider by remember { mutableStateOf(false) }
@@ -69,9 +69,9 @@ fun CircleLensBottomBar(
                 showRecentSlider = false
                 onShareEntireScreenDirect(target)
             },
-            onOpenAllTargetsPicker = {
+            onOpenShareSheet = {
                 showRecentSlider = false
-                onOpenAllTargetsPicker()
+                onOpenShareSheet()
             },
             onDismiss = {
                 showRecentSlider = false

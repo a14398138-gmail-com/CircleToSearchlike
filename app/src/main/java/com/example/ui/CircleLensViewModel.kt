@@ -55,6 +55,14 @@ data class CircleLensUiState(
 
 class CircleLensViewModel(application: Application) : AndroidViewModel(application) {
 
+    companion object {
+        /** Crops smaller than this (in px, longest side) are upscaled before re-OCR. */
+        private const val CROP_OCR_TARGET_MAX_DIM = 1600
+
+        /** Upper bound for the crop upscale factor. */
+        private const val CROP_OCR_MAX_UPSCALE = 2.5f
+    }
+
     private val ocrManager = OcrManager()
     val shareManager = ShareManager.getInstance(application)
 
@@ -377,28 +385,62 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
             imageRectOnDisplay.top + lastToken.boundingBox.bottom * scaleY
         )
 
-        // Concatenate text intelligently (add newline between lines, space between English words, no space for Japanese chars)
-        val sb = StringBuilder()
-        var lastLineIdx = -1
-        for (i in selected.indices) {
-            val token = selected[i]
-            if (lastLineIdx != -1 && token.lineIndex != lastLineIdx) {
-                sb.append("\n")
-            } else if (i > 0 && !selected[i - 1].isJapaneseOrCjk && !token.isJapaneseOrCjk) {
-                sb.append(" ")
-            }
-            sb.append(token.text)
-            lastLineIdx = token.lineIndex
-        }
+        val joinedText = joinSelectedText(selected)
 
         return TextSelectionState(
             startTokenIndex = minIdx,
             endTokenIndex = maxIdx,
             selectedTokens = selected,
-            fullText = sb.toString(),
+            fullText = joinedText,
             startPinPoint = Offset(startDisplayBox.left, startDisplayBox.top),
             endPinPoint = Offset(endDisplayBox.right, endDisplayBox.bottom)
         )
+    }
+
+    /**
+     * Concatenates tokens into selection text: newline between lines, no space
+     * around Japanese/CJK tokens, and for Latin/digit tokens a space only when
+     * the physical gap between the token boxes is wide enough to be a real word
+     * space.
+     *
+     * The previous rule inserted a space between *every* pair of non-CJK
+     * tokens, which shredded symbol-split sequences into things like
+     * "2 0 2 5 / 0 4 / 2 1" and "m y way" whenever ML Kit returned a Latin word
+     * or a number as individual character symbols.
+     */
+    private fun joinSelectedText(selected: List<OcrToken>): String {
+        val sb = StringBuilder()
+        var lastLineIdx = -1
+        for (i in selected.indices) {
+            val token = selected[i]
+            if (i > 0) {
+                if (token.lineIndex != lastLineIdx) {
+                    sb.append("\n")
+                } else {
+                    val prev = selected[i - 1]
+                    if (!prev.isJapaneseOrCjk && !token.isJapaneseOrCjk && shouldInsertSpace(prev, token)) {
+                        sb.append(" ")
+                    }
+                }
+            }
+            sb.append(token.text)
+            lastLineIdx = token.lineIndex
+        }
+        return sb.toString()
+    }
+
+    private fun shouldInsertSpace(prev: OcrToken, cur: OcrToken): Boolean {
+        // Closing punctuation binds to the previous token: "410 ," -> "410,"
+        if (cur.text.isNotEmpty() && cur.text.all { it in ",.!?;:%/)]}\u3001\u3002" }) return false
+        // Nothing separates a token from a preceding opening bracket
+        if (prev.text.isNotEmpty() && prev.text.all { it in "([{" }) return false
+
+        val gap = cur.boundingBox.left - prev.boundingBox.right
+        if (gap <= 0) return false
+        val refHeight = min(prev.boundingBox.height(), cur.boundingBox.height()).coerceAtLeast(1)
+        // Intra-word symbol gaps are a small fraction of the glyph height,
+        // while a real word space is roughly a quarter of it or more.
+        return gap > refHeight * 0.25f
     }
 
     /**
@@ -571,37 +613,150 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    /**
+     * Re-runs OCR on just the circled region instead of reusing the full-screen
+     * result. The crop is cut from the original bitmap, upscaled when small so
+     * glyphs get more pixels, and recognized on its own — the region the user
+     * explicitly cared about gets a second, better look, which fixes many
+     * one-character errors the full-screen pass made.
+     *
+     * If the re-run finds nothing, it falls back to the previous behaviour of
+     * selecting the full-screen tokens inside the frame.
+     */
     fun ocrInsideCrop(imageRectDisplay: RectF, bitmapWidth: Int, bitmapHeight: Int) {
         val crop = _uiState.value.activeCropSelection ?: return
-        val all = _uiState.value.allTokens
-        if (all.isEmpty()) return
+        val source = _uiState.value.currentBitmap ?: return
+        if (_uiState.value.isOcrRunning) return
+        if (imageRectDisplay.width() <= 0f || imageRectDisplay.height() <= 0f) return
 
         val scaleX = bitmapWidth / imageRectDisplay.width()
         val scaleY = bitmapHeight / imageRectDisplay.height()
 
-        val srcLeft = ((crop.rect.left - imageRectDisplay.left) * scaleX).toInt()
-        val srcTop = ((crop.rect.top - imageRectDisplay.top) * scaleY).toInt()
-        val srcRight = ((crop.rect.right - imageRectDisplay.left) * scaleX).toInt()
-        val srcBottom = ((crop.rect.bottom - imageRectDisplay.top) * scaleY).toInt()
+        val padPx = 12
+        val srcLeft = (((crop.rect.left - imageRectDisplay.left) * scaleX).toInt() - padPx).coerceIn(0, bitmapWidth - 1)
+        val srcTop = (((crop.rect.top - imageRectDisplay.top) * scaleY).toInt() - padPx).coerceIn(0, bitmapHeight - 1)
+        val srcRight = (((crop.rect.right - imageRectDisplay.left) * scaleX).toInt() + padPx).coerceIn(srcLeft + 1, bitmapWidth)
+        val srcBottom = (((crop.rect.bottom - imageRectDisplay.top) * scaleY).toInt() + padPx).coerceIn(srcTop + 1, bitmapHeight)
+        val srcW = srcRight - srcLeft
+        val srcH = srcBottom - srcTop
+        if (srcW < 16 || srcH < 16) return
 
-        val insideTokens = all.filter { token ->
+        // Full-screen tokens inside the frame, kept for fallback and for
+        // approximating the selection index range used by the pin handles.
+        val insideTokens = _uiState.value.allTokens.filter { token ->
             val box = token.boundingBox
             box.centerX() in srcLeft..srcRight && box.centerY() in srcTop..srcBottom
         }
+        val fallbackStartIdx = insideTokens.minOfOrNull { it.globalIndex } ?: 0
+        val fallbackEndIdx = insideTokens.maxOfOrNull { it.globalIndex } ?: 0
 
-        if (insideTokens.isNotEmpty()) {
-            val minIdx = insideTokens.minOf { it.globalIndex }
-            val maxIdx = insideTokens.maxOf { it.globalIndex }
-            val sel = buildTextSelection(minIdx, maxIdx, imageRectDisplay, bitmapWidth, bitmapHeight)
-            _uiState.value = _uiState.value.copy(
-                textSelection = sel,
-                activeCropSelection = null,
-                feedbackMessage = "枠内のテキストを抽出しました (${insideTokens.size}要素)"
-            )
-        } else {
-            _uiState.value = _uiState.value.copy(
-                feedbackMessage = "枠内にテキストが見つかりませんでした"
-            )
+        _uiState.value = _uiState.value.copy(
+            isOcrRunning = true,
+            feedbackMessage = "枠内を再OCR中..."
+        )
+
+        viewModelScope.launch {
+            var cropBmp: Bitmap? = null
+            var ocrInput: Bitmap? = null
+            try {
+                cropBmp = Bitmap.createBitmap(source, srcLeft, srcTop, srcW, srcH)
+
+                // Upscale small crops so characters reach a comfortable pixel size
+                val maxDim = max(srcW, srcH)
+                val upscale = if (maxDim < CROP_OCR_TARGET_MAX_DIM) {
+                    min(CROP_OCR_MAX_UPSCALE, CROP_OCR_TARGET_MAX_DIM.toFloat() / maxDim)
+                } else {
+                    1f
+                }
+                ocrInput = if (upscale > 1f) {
+                    Bitmap.createScaledBitmap(
+                        cropBmp,
+                        (srcW * upscale).toInt().coerceAtLeast(1),
+                        (srcH * upscale).toInt().coerceAtLeast(1),
+                        true
+                    )
+                } else {
+                    cropBmp
+                }
+
+                val items = ocrManager.recognizeText(ocrInput)
+
+                // Map token boxes from OCR-input coordinates back to original bitmap coordinates
+                val mappedTokens = mutableListOf<OcrToken>()
+                var globalIdx = 0
+                for (item in items) {
+                    for (token in item.tokens) {
+                        val b = token.boundingBox
+                        val mappedBox = Rect(
+                            srcLeft + (b.left / upscale).toInt(),
+                            srcTop + (b.top / upscale).toInt(),
+                            srcLeft + (b.right / upscale).toInt(),
+                            srcTop + (b.bottom / upscale).toInt()
+                        )
+                        mappedTokens.add(
+                            token.copy(
+                                id = "crop_${token.id}",
+                                boundingBox = mappedBox,
+                                globalIndex = globalIdx++
+                            )
+                        )
+                    }
+                }
+
+                if (mappedTokens.isNotEmpty()) {
+                    val dispScaleX = imageRectDisplay.width() / bitmapWidth
+                    val dispScaleY = imageRectDisplay.height() / bitmapHeight
+                    fun toDisplay(box: Rect) = RectF(
+                        imageRectDisplay.left + box.left * dispScaleX,
+                        imageRectDisplay.top + box.top * dispScaleY,
+                        imageRectDisplay.left + box.right * dispScaleX,
+                        imageRectDisplay.top + box.bottom * dispScaleY
+                    )
+                    val startBox = toDisplay(mappedTokens.first().boundingBox)
+                    val endBox = toDisplay(mappedTokens.last().boundingBox)
+
+                    _uiState.value = _uiState.value.copy(
+                        textSelection = TextSelectionState(
+                            startTokenIndex = fallbackStartIdx,
+                            endTokenIndex = fallbackEndIdx,
+                            selectedTokens = mappedTokens,
+                            fullText = joinSelectedText(mappedTokens),
+                            startPinPoint = Offset(startBox.left, startBox.top),
+                            endPinPoint = Offset(endBox.right, endBox.bottom)
+                        ),
+                        activeCropSelection = null,
+                        isOcrRunning = false,
+                        feedbackMessage = "枠内テキストを再OCRで抽出しました (${mappedTokens.size}要素)"
+                    )
+                } else if (insideTokens.isNotEmpty()) {
+                    // Re-OCR found nothing: fall back to the full-screen tokens in the frame
+                    val sel = buildTextSelection(fallbackStartIdx, fallbackEndIdx, imageRectDisplay, bitmapWidth, bitmapHeight)
+                    _uiState.value = _uiState.value.copy(
+                        textSelection = sel,
+                        activeCropSelection = null,
+                        isOcrRunning = false,
+                        feedbackMessage = "枠内のテキストを抽出しました (${insideTokens.size}要素)"
+                    )
+                } else {
+                    _uiState.value = _uiState.value.copy(
+                        isOcrRunning = false,
+                        feedbackMessage = "枠内にテキストが見つかりませんでした"
+                    )
+                }
+            } catch (e: Throwable) {
+                Log.e("CircleLensVM", "Crop re-OCR failed", e)
+                _uiState.value = _uiState.value.copy(
+                    isOcrRunning = false,
+                    feedbackMessage = "枠内OCRに失敗しました"
+                )
+            } finally {
+                if (ocrInput != null && ocrInput != cropBmp) {
+                    try { ocrInput.recycle() } catch (_: Throwable) {}
+                }
+                if (cropBmp != null && cropBmp != source) {
+                    try { cropBmp.recycle() } catch (_: Throwable) {}
+                }
+            }
         }
     }
 

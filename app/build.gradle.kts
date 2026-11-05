@@ -12,6 +12,7 @@ plugins {
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
+  ndkVersion = "27.0.12077973"
 
   defaultConfig {
     applicationId = "com.aistudio.circleocr.qkrvwz"
@@ -21,6 +22,24 @@ android {
     versionName = "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+    ndk {
+      abiFilters += listOf("arm64-v8a")
+    }
+    externalNativeBuild {
+      cmake {
+        arguments += "-DLLAMA_CPP_DIR=${file("../../../llama.cpp").absolutePath}"
+        arguments += "-DFETCHCONTENT_SOURCE_DIR_KLEIDIAI=${file("../../../.tools/kleidiai-src/kleidiai-v1.32.0").absolutePath}"
+        arguments += "-DCMAKE_BUILD_TYPE=Release"
+      }
+    }
+  }
+
+  externalNativeBuild {
+    cmake {
+      path = file("src/main/cpp/CMakeLists.txt")
+      version = "3.22.1"
+    }
   }
 
   signingConfigs {

@@ -25,7 +25,10 @@ class MainActivity : ComponentActivity() {
         disableWindowTransitions()
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        handleIncomingIntent(intent)
+        if (handleIncomingIntent(intent)) {
+            // Intent fully handled and the activity is closing (e.g. PROCESS_TEXT share bridge)
+            return
+        }
 
         lifecycleScope.launch {
             viewModel.closeAppEvent.collect {
@@ -74,8 +77,9 @@ class MainActivity : ComponentActivity() {
         handleIncomingIntent(intent)
     }
 
-    private fun handleIncomingIntent(intent: Intent?) {
-        if (intent == null) return
+    /** Returns true when the intent was fully handled and the activity is closing. */
+    private fun handleIncomingIntent(intent: Intent?): Boolean {
+        if (intent == null) return false
 
         val isAssist = intent.getBooleanExtra("from_voice_assist", false) ||
                 intent.action == Intent.ACTION_ASSIST ||
@@ -85,7 +89,7 @@ class MainActivity : ComponentActivity() {
         val captured = CircleLensScreenshotHolder.consumeScreenshot()
         if (captured != null) {
             viewModel.loadBitmapDirect(captured, null)
-            return
+            return false
         }
 
         // 2. Check direct screenshot parcelable in Intent extras
@@ -104,10 +108,27 @@ class MainActivity : ComponentActivity() {
 
         if (screenshotBitmap != null) {
             viewModel.loadBitmapDirect(screenshotBitmap, null)
-            return
+            return false
         }
 
-        // 3. Check shared image URI
+        // 3. Text selected in another app ("Circle OCR" entry in the text
+        // selection toolbar, declared via ACTION_PROCESS_TEXT in the manifest):
+        // open the share sheet for that text right away and close this overlay,
+        // so the app acts as a share bridge for selected text.
+        if (intent.action == Intent.ACTION_PROCESS_TEXT) {
+            val selectedText = try {
+                intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()
+            } catch (e: Throwable) {
+                null
+            }
+            if (!selectedText.isNullOrBlank()) {
+                viewModel.shareManager.shareTextGeneral(selectedText)
+            }
+            closeApp()
+            return true
+        }
+
+        // 4. Check shared image URI
         when (intent.action) {
             Intent.ACTION_SEND -> {
                 if (intent.type?.startsWith("image/") == true) {
@@ -134,5 +155,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        return false
     }
 }
