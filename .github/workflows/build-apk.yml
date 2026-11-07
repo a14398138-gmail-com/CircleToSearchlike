@@ -45,7 +45,8 @@ jobs:
           esac
           printf '%s' "$CLEAN" | base64 -d > "$RUNNER_TEMP/debug.keystore"
           ls -la "$RUNNER_TEMP/debug.keystore"
-          keytool -list -keystore "$RUNNER_TEMP/debug.keystore" -storepass android 2>/dev/null | head -5
+          echo "--- keystore diagnostics (type / aliases) ---"
+          keytool -list -keystore "$RUNNER_TEMP/debug.keystore" -storepass android 2>&1 | head -8 || true
 
       - name: Build release APK
         env:
