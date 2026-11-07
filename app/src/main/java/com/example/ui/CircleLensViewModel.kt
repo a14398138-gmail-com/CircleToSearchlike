@@ -702,7 +702,9 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
                 }
                 // Map region tokens back into full-bitmap coordinates
                 val regionTokens = results.flatMap { it.tokens }.map { token ->
-                    token.copy(boundingBox = Rect(token.boundingBox).offset(srcLeft, srcTop))
+                    token.copy(
+                        boundingBox = Rect(token.boundingBox).also { it.offset(srcLeft, srcTop) }
+                    )
                 }
                 val sel = buildTextSelectionFromTokens(
                     regionTokens, 0, regionTokens.size - 1, imageRectDisplay, bitmapWidth, bitmapHeight
