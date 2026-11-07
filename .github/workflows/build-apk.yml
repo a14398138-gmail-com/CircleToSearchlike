@@ -7,6 +7,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,6 +65,20 @@ jobs:
           sha256sum "$APK"
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$APK"
 
+      - name: Publish APK to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+          SHA=${GITHUB_SHA::7}
+          TAG="build-$SHA"
+          cp "$APK" "circle-ocr-$SHA.apk"
+          gh release create "$TAG" "circle-ocr-$SHA.apk" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Circle OCR build $SHA" \
+            --notes "Automated build from $GITHUB_SHA" \
+            --prerelease
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -77,7 +93,8 @@ jobs:
           APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
           SIZE=$(stat -c%s "$APK")
           SHA=${GITHUB_SHA::7}
-          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          TAG="build-$SHA"
+          DOWNLOAD_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/circle-ocr-$SHA.apk"
           if [ -z "$DISCORD_WEBHOOK_URL" ]; then
             echo "DISCORD_WEBHOOK_URL secret is not set; skipping Discord notification"
             exit 0
@@ -85,12 +102,12 @@ jobs:
           # Discord upload limit is 10MB for non-Nitro webhooks
           if [ "$SIZE" -lt 10000000 ]; then
             curl -sS -o /dev/null -w "discord upload HTTP %{http_code}\n" \
-              -F "payload_json={\"content\":\"Circle OCR APK build \`$SHA\` ($SIZE bytes): $RUN_URL\"}" \
+              -F "payload_json={\"content\":\"Circle OCR APK build \`$SHA\` ($SIZE bytes): $DOWNLOAD_URL\"}" \
               -F "files[0]=@$APK;filename=circle-ocr-$SHA.apk" \
               "$DISCORD_WEBHOOK_URL"
           else
             curl -sS -o /dev/null -w "discord notify HTTP %{http_code}\n" \
               -H "Content-Type: application/json" \
-              -d "{\"content\":\"Circle OCR APK build \`$SHA\` finished ($SIZE bytes). The APK exceeds the 10MB Discord upload limit, so download it from the run artifacts: $RUN_URL\"}" \
+              -d "{\"content\":\"Circle OCR APK build \`$SHA\` finished ($SIZE bytes). Direct download (.apk): $DOWNLOAD_URL\"}" \
               "$DISCORD_WEBHOOK_URL"
           fi
