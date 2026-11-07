@@ -47,10 +47,10 @@ class TranslateController(context: Context) {
             // Android heap pointers carry a 0xB4 tag byte, so a valid handle is
             // negative as a signed Long. Only 0 and the reserved codes are errors.
             when (h) {
-                0L -> LoadResult.Error("モデル読み込み失敗")
-                -2L -> LoadResult.Error("モデルファイルを読めませんでした")
-                -3L -> LoadResult.Error("コンテキスト作成に失敗しました")
-                -1L -> LoadResult.Error("モデル読み込みで例外が発生しました")
+                0L -> LoadResult.Error("モデル読み込み失敗" + errorDetailSuffix())
+                -2L -> LoadResult.Error("モデルファイルを読めませんでした" + errorDetailSuffix())
+                -3L -> LoadResult.Error("コンテキスト作成に失敗しました" + errorDetailSuffix())
+                -1L -> LoadResult.Error("モデル読み込みで例外が発生しました" + errorDetailSuffix())
                 else -> {
                     sharedHandle = h
                     LoadResult.Ok
@@ -58,30 +58,6 @@ class TranslateController(context: Context) {
             }
         }
     }
-
-    suspend fun translate(text: String, srcLang: String, tgtLang: String): TranslateResult =
-        engineMutex.withLock {
-            withContext(Dispatchers.Default) {
-                val h = sharedHandle
-                if (h == 0L) return@withContext TranslateResult.Error("モデル未読み込み")
-                val prompt = PlamoPrompt.build(text, tgtLang, srcLang)
-                val result = try {
-                    sharedEngine.nativeTranslate(h, prompt, 1024)
-                } catch (t: Throwable) {
-                    null
-                }
-                if (result == null) {
-                    TranslateResult.Error("翻訳に失敗しました（テキストが長すぎる可能性があります）")
-                } else {
-                    val stats = try {
-                        sharedEngine.parseStats(sharedEngine.nativeStats(h))
-                    } catch (t: Throwable) {
-                        null
-                    }
-                    TranslateResult.Ok(result.trim(), stats)
-                }
-            }
-        }
 
     /** Streaming variant: [onPartial] receives the accumulated translation as it grows. */
     suspend fun translateStream(
@@ -104,9 +80,38 @@ class TranslateController(context: Context) {
                 null
             }
             if (result == null) {
-                TranslateResult.Error("翻訳に失敗しました（テキストが長すぎる可能性があります）")
+                TranslateResult.Error("翻訳に失敗しました（テキストが長すぎる可能性があります）" + errorDetailSuffix())
             } else {
                 TranslateResult.Ok(result.trim(), null)
+            }
+        }
+    }
+
+    /** Tail of the llama.cpp log captured natively; empty when unavailable. */
+    fun lastErrorDetail(): String = try {
+        sharedEngine.nativeLastError().trim().takeLast(400)
+    } catch (t: Throwable) {
+        ""
+    }
+
+    private fun errorDetailSuffix(): String {
+        val d = lastErrorDetail()
+        return if (d.isBlank()) "" else "\n詳細: $d"
+    }
+
+    /**
+     * Frees the native model/context (about 550MB) so low-memory pressure can
+     * evict it. The next [loadModel] call transparently reloads from disk.
+     * Note on cancellation: a *queued* call behind [engineMutex] is
+     * cancellable, but a native generation already running cannot be
+     * interrupted — it holds the mutex until it finishes (max 1024 tokens).
+     */
+    suspend fun releaseModel() = engineMutex.withLock {
+        val h = sharedHandle
+        if (h != 0L) {
+            sharedHandle = 0L
+            withContext(Dispatchers.Default) {
+                try { sharedEngine.nativeFree(h) } catch (_: Throwable) {}
             }
         }
     }

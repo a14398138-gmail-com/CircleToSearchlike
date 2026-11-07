@@ -64,9 +64,17 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         disableWindowTransitions()
-        val captured = CircleLensScreenshotHolder.consumeScreenshot()
-        if (captured != null) {
-            viewModel.loadBitmapDirect(captured, null)
+        // Single consumer path: ask the ViewModel to pick up any new pending
+        // screenshot (it deduplicates by screenshot id).
+        viewModel.loadPendingScreenshotIfNew()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_MODERATE) {
+            // Let the ~550MB translation model be evicted under pressure;
+            // it reloads transparently on the next translate.
+            viewModel.onLowMemory()
         }
     }
 
@@ -85,10 +93,9 @@ class MainActivity : ComponentActivity() {
                 intent.action == Intent.ACTION_ASSIST ||
                 intent.action == Intent.ACTION_VOICE_COMMAND
 
-        // 1. Check Voice Assistant / ScreenshotHolder
-        val captured = CircleLensScreenshotHolder.consumeScreenshot()
-        if (captured != null) {
-            viewModel.loadBitmapDirect(captured, null)
+        // 1. Check Voice Assistant / ScreenshotHolder (single consumer path)
+        if (CircleLensScreenshotHolder.hasPendingScreenshot()) {
+            viewModel.loadPendingScreenshotIfNew()
             return false
         }
 

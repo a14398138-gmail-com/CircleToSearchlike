@@ -68,6 +68,13 @@ fun TranslateBar(
     modifier: Modifier = Modifier,
     controller: TranslateController,
     sourceText: String,
+    // Session state is owned by CircleLensViewModel so rotation / Activity
+    // recreation keeps the source text, translation and language pair.
+    srcLang: String,
+    tgtLang: String,
+    result: String?,
+    onResultChange: (String?) -> Unit,
+    onSwapLangs: () -> Unit,
     refreshKey: Int = 0,
     onPickModelFile: () -> Unit,
     onClose: () -> Unit,
@@ -75,12 +82,9 @@ fun TranslateBar(
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
 
-    var srcLang by remember(sourceText) { mutableStateOf(TranslateController.detectLang(sourceText)) }
-    var tgtLang by remember(sourceText) { mutableStateOf(if (srcLang == "ja") "en" else "ja") }
     var modelPresent by remember { mutableStateOf(controller.modelExists()) }
     var busy by remember { mutableStateOf(false) }
     var errorText by remember { mutableStateOf<String?>(null) }
-    var result by remember(sourceText) { mutableStateOf<String?>(null) }
     var downloadProgress by remember { mutableStateOf<Float?>(null) }
     var panelOffsetY by remember(sourceText) { mutableFloatStateOf(0f) }
 
@@ -100,10 +104,10 @@ fun TranslateBar(
             var gotPartial = false
             when (val r = controller.translateStream(sourceText, srcLang, tgtLang) { partial ->
                 gotPartial = true
-                result = partial
+                onResultChange(partial)
             }) {
                 is TranslateController.TranslateResult.Ok -> {
-                    result = r.text
+                    onResultChange(r.text)
                     panelOffsetY = 0f
                 }
                 is TranslateController.TranslateResult.Error -> {
@@ -251,9 +255,7 @@ fun TranslateBar(
                     LanguageChip(
                         label = TranslateController.langLabel(srcLang),
                         enabled = !busy,
-                        onClick = {
-                            val s = srcLang; srcLang = tgtLang; tgtLang = s
-                        },
+                        onClick = { onSwapLangs() },
                     )
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.ArrowForward,
@@ -266,9 +268,7 @@ fun TranslateBar(
                     LanguageChip(
                         label = TranslateController.langLabel(tgtLang),
                         enabled = !busy,
-                        onClick = {
-                            val s = srcLang; srcLang = tgtLang; tgtLang = s
-                        },
+                        onClick = { onSwapLangs() },
                     )
                     Spacer(Modifier.weight(1f))
                     IconButton(

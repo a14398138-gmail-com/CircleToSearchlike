@@ -45,9 +45,25 @@ class ShareManager private constructor(context: Context) {
     private val _recentImageShareTargets = MutableStateFlow<List<ShareTarget>>(emptyList())
     val recentImageShareTargets: StateFlow<List<ShareTarget>> = _recentImageShareTargets.asStateFlow()
 
-    init {
+    // Loading persisted targets queries PackageManager for every share
+    // candidate and rasterises app icons — far too heavy to run synchronously
+    // on the main thread from the constructor (the old init did exactly
+    // that, twice over once the ViewModel refreshed). Construction is now
+    // cheap; call [initialize] once from an IO dispatcher.
+    @Volatile
+    private var initialized = false
+
+    private var cachedTextTargets: List<ShareTarget> = emptyList()
+    private var cachedImageTargets: List<ShareTarget> = emptyList()
+
+    suspend fun initialize() = withContext(Dispatchers.IO) {
+        if (initialized) return@withContext
         loadPersistedTargets()
+        initialized = true
     }
+
+    fun cachedAvailableTargets(isImage: Boolean): List<ShareTarget> =
+        if (isImage) cachedImageTargets else cachedTextTargets
 
     companion object {
         @Volatile
@@ -63,6 +79,8 @@ class ShareManager private constructor(context: Context) {
     private fun loadPersistedTargets() {
         val availableText = getAvailableShareTargets("text/plain")
         val availableImg = getAvailableShareTargets("image/*")
+        cachedTextTargets = availableText
+        cachedImageTargets = availableImg
 
         // Load Text History
         val textHistoryRaw = prefs.getString("recent_text_history", null)

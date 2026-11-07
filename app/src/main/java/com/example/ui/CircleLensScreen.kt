@@ -53,11 +53,8 @@ fun CircleLensScreen(
     val appContext = LocalContext.current.applicationContext
     val translateController = remember { TranslateController(appContext) }
     val screenScope = rememberCoroutineScope()
-    var translateText by remember { mutableStateOf<String?>(null) }
-    // A new capture starts a fresh session: never reopen with the translate bar up.
-    androidx.compose.runtime.LaunchedEffect(uiState.currentBitmap) {
-        translateText = null
-    }
+    // Translation session state lives in the ViewModel (uiState.translate*);
+    // a new capture clears it inside loadBitmapDirect().
     // Warm up the translation model as soon as a capture arrives, so the load
     // time hides behind the user's selection gestures instead of the translate tap.
     androidx.compose.runtime.LaunchedEffect(Unit) {
@@ -221,7 +218,7 @@ fun CircleLensScreen(
                     onTranslate = {
                         val text = viewModel.getSelectedTextString()
                         if (text.isNotBlank()) {
-                            translateText = text
+                            viewModel.openTranslate(text)
                         }
                     }
                 )
@@ -279,8 +276,39 @@ fun CircleLensScreen(
             }
         }
 
+        // Minimal transient feedback (NOT the old permanent banner the user
+        // asked to remove): shows feedbackMessage briefly, then auto-dismisses.
+        val feedback = uiState.feedbackMessage
+        androidx.compose.runtime.LaunchedEffect(feedback) {
+            if (feedback != null) {
+                kotlinx.coroutines.delay(2600)
+                viewModel.dismissFeedback()
+            }
+        }
+        AnimatedVisibility(
+            visible = feedback != null,
+            enter = fadeIn() + slideInVertically { it / 2 },
+            exit = fadeOut() + slideOutVertically { it / 2 },
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(bottom = 104.dp)
+        ) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = Color(0xE61F2937),
+            ) {
+                Text(
+                    text = feedback ?: "",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp)
+                )
+            }
+        }
+
         // Bottom area: translate bar (when translating) or the main toolbar
-        val currentTranslateText = translateText
+        val currentTranslateText = uiState.translateSourceText
         if (currentTranslateText != null) {
             TranslateBar(
                 modifier = Modifier
@@ -289,9 +317,14 @@ fun CircleLensScreen(
                     .padding(horizontal = 12.dp, vertical = 16.dp),
                 controller = translateController,
                 sourceText = currentTranslateText,
+                srcLang = uiState.translateSrcLang,
+                tgtLang = uiState.translateTgtLang,
+                result = uiState.translateResult,
+                onResultChange = { viewModel.updateTranslateResult(it) },
+                onSwapLangs = { viewModel.swapTranslateLangs() },
                 refreshKey = modelPickTick,
                 onPickModelFile = { modelPicker.launch(arrayOf("*/*")) },
-                onClose = { translateText = null }
+                onClose = { viewModel.closeTranslate() }
             )
         } else {
             // Minimal Icon-Only Bottom Toolbar (White frosted glass + Black only, no drag handle)

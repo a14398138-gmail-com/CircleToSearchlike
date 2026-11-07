@@ -158,6 +158,7 @@ static jstring translate_impl(JNIEnv * env, jlong handle, jstring prompt, jint m
     // Greedy decode loop.
     llama_sampler * smpl = llama_sampler_init_greedy();
     std::string out;
+    std::string pending; // un-emitted bytes held back for UTF-8 boundary safety
     int32_t n_gen = 0;
     auto t1 = std::chrono::steady_clock::now();
     const llama_token tag_token = 16; // <|plamo:tag|> == EOT for plamo3
@@ -167,12 +168,34 @@ static jstring translate_impl(JNIEnv * env, jlong handle, jstring prompt, jint m
         std::string piece = token_piece(e->vocab, tok);
         out += piece;
         if (callback != nullptr && on_token_mid != nullptr && !piece.empty()) {
-            jstring js = env->NewStringUTF(piece.c_str());
-            env->CallVoidMethod(callback, on_token_mid, js);
-            env->DeleteLocalRef(js);
-            if (env->ExceptionCheck()) {
-                env->ExceptionClear();
-                break;
+            // UTF-8 safety: a token piece can end in the middle of a
+            // multi-byte sequence, and NewStringUTF on a split sequence is
+            // invalid modified UTF-8. Buffer the bytes and only emit the
+            // longest prefix that ends on a character boundary; the rest is
+            // prepended to the next piece (and flushed after the loop).
+            pending += piece;
+            size_t valid = pending.size();
+            // Walk back over trailing continuation bytes (10xxxxxx).
+            size_t i = pending.size();
+            while (i > 0 && (static_cast<unsigned char>(pending[i - 1]) & 0xC0) == 0x80) i--;
+            if (i > 0) {
+                unsigned char lead = static_cast<unsigned char>(pending[i - 1]);
+                size_t need = (lead < 0x80) ? 1 : (lead < 0xE0) ? 2 : (lead < 0xF0) ? 3 : 4;
+                size_t have = pending.size() - (i - 1);
+                if (have < need) valid = i - 1; // incomplete trailing sequence: hold it
+            } else if (!pending.empty()) {
+                valid = 0; // only continuation bytes so far: hold everything
+            }
+            if (valid > 0) {
+                std::string chunk = pending.substr(0, valid);
+                pending.erase(0, valid);
+                jstring js = env->NewStringUTF(chunk.c_str());
+                env->CallVoidMethod(callback, on_token_mid, js);
+                env->DeleteLocalRef(js);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    break;
+                }
             }
         }
         n_gen++;
@@ -182,16 +205,20 @@ static jstring translate_impl(JNIEnv * env, jlong handle, jstring prompt, jint m
             break;
         }
     }
+    // Flush any held-back bytes (a truncated final sequence is emitted
+    // as-is; the accumulated `out` returned below is authoritative).
+    if (callback != nullptr && on_token_mid != nullptr && !pending.empty()) {
+        jstring js = env->NewStringUTF(pending.c_str());
+        env->CallVoidMethod(callback, on_token_mid, js);
+        env->DeleteLocalRef(js);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        pending.clear();
+    }
     e->last_decode_ms = now_ms(t1);
     e->last_gen_tokens = n_gen;
     llama_sampler_free(smpl);
     LOGI("prompt %d tok (%.1f ms), gen %d tok (%.1f ms)", n_prompt, e->last_prefill_ms, n_gen, e->last_decode_ms);
     return env->NewStringUTF(out.c_str());
-}
-
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_koike_llama_LlamaEngine_nativeTranslate(JNIEnv * env, jobject /*thiz*/, jlong handle, jstring prompt, jint max_tokens) {
-    return translate_impl(env, handle, prompt, max_tokens, nullptr, nullptr);
 }
 
 extern "C" JNIEXPORT jstring JNICALL

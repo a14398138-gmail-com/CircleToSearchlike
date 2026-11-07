@@ -62,20 +62,23 @@ class OcrManager {
      * so that the user's first actual screen OCR executes with zero cold-start delay.
      */
     suspend fun warmUp() = withContext(Dispatchers.Default) {
+        val dummyBmp = Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888)
         try {
-            val dummyBmp = Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888)
             val dummyImage = InputImage.fromBitmap(dummyBmp, 0)
+            // Actually await the ML Kit Tasks: discarding the returned Task
+            // (the old code) meant warm-up returned before inference finished
+            // and the cold-start saving was not guaranteed.
             coroutineScope {
                 async {
                     try {
-                        japaneseRecognizer.process(dummyImage)
+                        com.google.android.gms.tasks.Tasks.await(japaneseRecognizer.process(dummyImage))
                     } catch (e: Throwable) {
                         Log.w("OcrManager", "Japanese warm-up warning", e)
                     }
                 }
                 async {
                     try {
-                        latinRecognizer.process(dummyImage)
+                        com.google.android.gms.tasks.Tasks.await(latinRecognizer.process(dummyImage))
                     } catch (e: Throwable) {
                         Log.w("OcrManager", "Latin warm-up warning", e)
                     }
@@ -84,6 +87,8 @@ class OcrManager {
             Log.d("OcrManager", "OCR engine pre-warmed successfully")
         } catch (e: Throwable) {
             Log.w("OcrManager", "OCR warm-up exception", e)
+        } finally {
+            try { dummyBmp.recycle() } catch (_: Throwable) {}
         }
     }
 
@@ -104,7 +109,10 @@ class OcrManager {
      *    never on a per-tile timeout.
      * All returned bounding boxes are in the original full bitmap coordinates.
      */
-    suspend fun recognizeText(bitmap: Bitmap): List<OcrTextItem> = withContext(Dispatchers.Default) {
+    suspend fun recognizeText(
+        bitmap: Bitmap,
+        onPartialResults: ((List<OcrTextItem>) -> Unit)? = null
+    ): List<OcrTextItem> = withContext(Dispatchers.Default) {
         val origW = bitmap.width
         val origH = bitmap.height
         if (origW <= 0 || origH <= 0) return@withContext emptyList()
@@ -122,13 +130,13 @@ class OcrManager {
         }
 
         try {
-            val japaneseResult = recognizeInTiles(japaneseRecognizer, safeBitmap)
+            val japaneseResult = recognizeInTiles(japaneseRecognizer, safeBitmap, onPartialResults)
             if (japaneseResult.isNotEmpty()) {
                 return@withContext japaneseResult
             }
 
             Log.w("OcrManager", "Japanese recognition returned empty, falling back to Latin recognizer")
-            recognizeInTiles(latinRecognizer, safeBitmap)
+            recognizeInTiles(latinRecognizer, safeBitmap, onPartialResults)
         } finally {
             if (safeBitmap != bitmap) {
                 try { safeBitmap.recycle() } catch (_: Throwable) {}
@@ -143,7 +151,8 @@ class OcrManager {
      */
     private suspend fun recognizeInTiles(
         recognizer: com.google.mlkit.vision.text.TextRecognizer,
-        bitmap: Bitmap
+        bitmap: Bitmap,
+        onPartialResults: ((List<OcrTextItem>) -> Unit)? = null
     ): List<OcrTextItem> {
         val width = bitmap.width
         val height = bitmap.height
@@ -194,6 +203,11 @@ class OcrManager {
                         Log.w("OcrManager", "Tile at y=$top timed out after ${TILE_TIMEOUT_MS}ms, skipping tile")
                     } else {
                         allItems.addAll(tileItems)
+                        // Progressive display: publish the merged result of
+                        // the tiles finished so far instead of all-or-nothing.
+                        if (onPartialResults != null && starts.size > 1) {
+                            try { onPartialResults(mergeTileResults(allItems.toList())) } catch (_: Throwable) {}
+                        }
                     }
                 }
             } finally {
@@ -216,7 +230,7 @@ class OcrManager {
      * line clipped by a tile seam can come back truncated/garbled from one tile
      * and whole from the next.
      */
-    private fun mergeTileResults(items: List<OcrTextItem>): List<OcrTextItem> {
+    fun mergeTileResults(items: List<OcrTextItem>): List<OcrTextItem> {
         if (items.isEmpty()) return emptyList()
 
         val kept = mutableListOf<OcrTextItem>()
@@ -363,7 +377,7 @@ class OcrManager {
                         emptyList<Text.Symbol>()
                     }
 
-                    if (symbols.isNotEmpty() && containsJapaneseOrMixed(elementText)) {
+                    if (symbols.isNotEmpty() && containsJapanese(elementText)) {
                         // Use ML Kit direct Symbol bounding boxes for highest character precision
                         for (symbol in symbols) {
                             val rawSymBox = symbol.boundingBox ?: rawElemBox
@@ -550,21 +564,6 @@ class OcrManager {
         }
 
         return rows.flatten()
-    }
-
-    private fun containsJapaneseOrMixed(text: String): Boolean {
-        for (i in 0 until text.length) {
-            val code = text[i].code
-            if (code in 0x3040..0x309F || // Hiragana
-                code in 0x30A0..0x30FF || // Katakana
-                code in 0x4E00..0x9FAF || // Kanji
-                code in 0x3400..0x4DBF || // Kanji Extension A
-                code in 0xFF00..0xFFEF   // Fullwidth
-            ) {
-                return true
-            }
-        }
-        return false
     }
 
     private fun containsJapanese(text: String): Boolean {
