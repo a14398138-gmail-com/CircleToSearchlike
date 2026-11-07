@@ -1,6 +1,5 @@
 package com.example.gesture
 
-import android.graphics.Rect
 import android.graphics.RectF
 import androidx.compose.ui.geometry.Offset
 import com.example.model.OcrToken
@@ -114,20 +113,45 @@ object GestureProcessor {
 
     /**
      * Finds token range (startGlobalIdx to endGlobalIdx) covered by user stroke.
-     * Uses directional stroke scanning and token intersection.
+     * Accepts precomputed display-space boxes to avoid per-token RectF allocation on every call.
+     * Tokens whose box cannot possibly intersect the stroke bounding box are skipped in O(1).
      */
     fun findTokensInStroke(
         strokePoints: List<Offset>,
         allTokens: List<OcrToken>,
-        imageToDisplayTransform: (Rect) -> RectF
+        displayBoxes: List<RectF>
     ): Pair<Int, Int>? {
         if (strokePoints.isEmpty() || allTokens.isEmpty()) return null
+        if (displayBoxes.size != allTokens.size) return null
 
-        val touchedGlobalIndices = mutableListOf<Int>()
         val tolerance = 32f // Touch tolerance for finger strokes
 
-        for (token in allTokens) {
-            val displayBox = imageToDisplayTransform(token.boundingBox)
+        // Precompute the stroke bounding box so far-away tokens are rejected in O(1)
+        var minX = Float.MAX_VALUE
+        var minY = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
+        for (pt in strokePoints) {
+            if (pt.x < minX) minX = pt.x
+            if (pt.y < minY) minY = pt.y
+            if (pt.x > maxX) maxX = pt.x
+            if (pt.y > maxY) maxY = pt.y
+        }
+        val strokeLeft = minX - tolerance
+        val strokeTop = minY - tolerance
+        val strokeRight = maxX + tolerance
+        val strokeBottom = maxY + tolerance
+
+        var minIdx = Int.MAX_VALUE
+        var maxIdx = Int.MIN_VALUE
+
+        for (i in allTokens.indices) {
+            val displayBox = displayBoxes[i]
+            if (displayBox.right < strokeLeft || displayBox.left > strokeRight ||
+                displayBox.bottom < strokeTop || displayBox.top > strokeBottom
+            ) {
+                continue
+            }
             val expanded = RectF(
                 displayBox.left - tolerance,
                 displayBox.top - tolerance,
@@ -136,16 +160,15 @@ object GestureProcessor {
             )
             for (pt in strokePoints) {
                 if (expanded.contains(pt.x, pt.y)) {
-                    touchedGlobalIndices.add(token.globalIndex)
+                    val idx = allTokens[i].globalIndex
+                    if (idx < minIdx) minIdx = idx
+                    if (idx > maxIdx) maxIdx = idx
                     break
                 }
             }
         }
 
-        if (touchedGlobalIndices.isEmpty()) return null
-
-        val minIdx = touchedGlobalIndices.minOrNull() ?: return null
-        val maxIdx = touchedGlobalIndices.maxOrNull() ?: return null
+        if (minIdx == Int.MAX_VALUE) return null
         return Pair(minIdx, maxIdx)
     }
 
@@ -156,15 +179,16 @@ object GestureProcessor {
     fun findClosestToken(
         point: Offset,
         allTokens: List<OcrToken>,
-        imageToDisplayTransform: (Rect) -> RectF
+        displayBoxes: List<RectF>
     ): OcrToken? {
         if (allTokens.isEmpty()) return null
+        if (displayBoxes.size != allTokens.size) return null
 
         var bestToken: OcrToken? = null
         var minScore = Float.MAX_VALUE
 
-        for (token in allTokens) {
-            val displayBox = imageToDisplayTransform(token.boundingBox)
+        for (i in allTokens.indices) {
+            val displayBox = displayBoxes[i]
 
             // Vertical distance with comfortable line snap band
             val vDist = when {
@@ -172,6 +196,9 @@ object GestureProcessor {
                 point.y < displayBox.top -> displayBox.top - point.y
                 else -> point.y - displayBox.bottom
             }
+
+            // distScore >= vDist * 2.2, so skip full scoring when vertical distance alone loses
+            if (vDist * 2.2f >= minScore) continue
 
             // Horizontal distance to box edge
             val hDist = when {
@@ -185,7 +212,7 @@ object GestureProcessor {
 
             if (distScore < minScore) {
                 minScore = distScore
-                bestToken = token
+                bestToken = allTokens[i]
             }
         }
 

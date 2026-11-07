@@ -19,3 +19,11 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# Keep ML Kit text recognition entry points (models are resolved reflectively)
+-keep class com.google.mlkit.** { *; }
+-dontwarn com.google.mlkit.**
+
+# Preserve stack traces for crash debugging
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile

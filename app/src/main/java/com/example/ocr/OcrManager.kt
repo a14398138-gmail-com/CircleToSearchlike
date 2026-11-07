@@ -37,6 +37,23 @@ class OcrManager {
     }
 
     /**
+     * Releases the native resources held by both recognizers.
+     * Must be called when the manager is no longer used (e.g. ViewModel onCleared).
+     */
+    fun close() {
+        try {
+            japaneseRecognizer.close()
+        } catch (e: Throwable) {
+            Log.w("OcrManager", "Failed to close Japanese recognizer", e)
+        }
+        try {
+            latinRecognizer.close()
+        } catch (e: Throwable) {
+            Log.w("OcrManager", "Failed to close Latin recognizer", e)
+        }
+    }
+
+    /**
      * Pre-warms both ML Kit OCR engines by processing a tiny dummy image in background.
      * This loads the neural network weights, TFLite delegates, and native libraries into memory
      * so that the user's first actual screen OCR executes with zero cold-start delay.
@@ -123,30 +140,47 @@ class OcrManager {
             return@withContext emptyList()
         }
 
+        // Track which recognitions actually finished, so we never recycle the input
+        // bitmap while a (cancelled) native ML Kit task may still be reading it.
+        var japaneseDone = false
+        var latinDone = false
+
         try {
-            // Attempt Japanese recognizer with a strict 2.5-second timeout
-            val japaneseResult = withTimeoutOrNull(2500L) {
-                runMlKitRecognition(japaneseRecognizer, inputImage, scaleRatio)
+            // Run Japanese and Latin recognizers in parallel.
+            // Japanese screens get results as soon as the Japanese engine finishes,
+            // while Latin-only screens no longer wait for the Japanese timeout first.
+            coroutineScope {
+                val japaneseDeferred = async {
+                    runMlKitRecognition(japaneseRecognizer, inputImage, scaleRatio)
+                        .also { japaneseDone = true }
+                }
+                val latinDeferred = async {
+                    runMlKitRecognition(latinRecognizer, inputImage, scaleRatio)
+                        .also { latinDone = true }
+                }
+
+                val japaneseResult = withTimeoutOrNull(2500L) { japaneseDeferred.await() }
+
+                if (!japaneseResult.isNullOrEmpty()) {
+                    latinDeferred.cancel()
+                    return@coroutineScope japaneseResult
+                }
+
+                Log.w("OcrManager", "Japanese recognition timed out or returned empty, falling back to Latin recognizer")
+
+                val latinResult = withTimeoutOrNull(1500L) { latinDeferred.await() }
+                japaneseDeferred.cancel()
+                latinDeferred.cancel()
+                latinResult ?: emptyList()
             }
-
-            if (japaneseResult != null && japaneseResult.isNotEmpty()) {
-                return@withContext japaneseResult
-            }
-
-            Log.w("OcrManager", "Japanese recognition timed out or returned empty, falling back to Latin recognizer")
-
-            // Fallback to Latin recognizer with a 1.5-second timeout
-            val latinResult = withTimeoutOrNull(1500L) {
-                runMlKitRecognition(latinRecognizer, inputImage, scaleRatio)
-            }
-
-            latinResult ?: emptyList()
         } finally {
-            if (isScaled && inferenceBitmap != bitmap && inferenceBitmap != safeBitmap) {
-                try { inferenceBitmap.recycle() } catch (_: Throwable) {}
-            }
-            if (safeBitmap != bitmap) {
-                try { safeBitmap.recycle() } catch (_: Throwable) {}
+            if (japaneseDone && latinDone) {
+                if (isScaled && inferenceBitmap != bitmap && inferenceBitmap != safeBitmap) {
+                    try { inferenceBitmap.recycle() } catch (_: Throwable) {}
+                }
+                if (safeBitmap != bitmap) {
+                    try { safeBitmap.recycle() } catch (_: Throwable) {}
+                }
             }
         }
     }

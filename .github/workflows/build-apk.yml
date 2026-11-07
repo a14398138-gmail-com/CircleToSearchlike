@@ -1,0 +1,88 @@
+name: Build signed APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-36.1 build-tools;36.0.0'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.3.1
+
+      - name: Decode signing keystore
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          # Keep only valid base64 characters, then rebuild padding
+          CLEAN=$(printf '%s' "$DEBUG_KEYSTORE_BASE64" | tr -cd 'A-Za-z0-9+/=')
+          echo "secret length after cleanup: ${#CLEAN}"
+          CLEAN=$(printf '%s' "$CLEAN" | sed 's/=*$//')
+          case $(( ${#CLEAN} % 4 )) in
+            2) CLEAN="${CLEAN}==" ;;
+            3) CLEAN="${CLEAN}=" ;;
+            1)
+              echo "::error::DEBUG_KEYSTORE_BASE64 looks truncated (length mod 4 == 1). Regenerate it with: base64 -w0 debug.keystore"
+              exit 1
+              ;;
+          esac
+          printf '%s' "$CLEAN" | base64 -d > "$RUNNER_TEMP/debug.keystore"
+          ls -la "$RUNNER_TEMP/debug.keystore"
+          keytool -list -keystore "$RUNNER_TEMP/debug.keystore" -storepass android 2>/dev/null | head -5
+
+      - name: Build release APK
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/debug.keystore
+          STORE_PASSWORD: android
+          KEY_PASSWORD: android
+          KEYSTORE_ALIAS: androiddebugkey
+        run: gradle assembleRelease --no-daemon
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Send APK to Discord webhook
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+          SIZE=$(stat -c%s "$APK")
+          SHA=${GITHUB_SHA::7}
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL secret is not set; skipping Discord notification"
+            exit 0
+          fi
+          # Discord upload limit is 10MB for non-Nitro webhooks
+          if [ "$SIZE" -lt 10000000 ]; then
+            curl -sS -o /dev/null -w "discord upload HTTP %{http_code}\n" \
+              -F "payload_json={\"content\":\"Circle OCR APK build \`$SHA\` ($SIZE bytes): $RUN_URL\"}" \
+              -F "files[0]=@$APK;filename=circle-ocr-$SHA.apk" \
+              "$DISCORD_WEBHOOK_URL"
+          else
+            curl -sS -o /dev/null -w "discord notify HTTP %{http_code}\n" \
+              -H "Content-Type: application/json" \
+              -d "{\"content\":\"Circle OCR APK build \`$SHA\` finished ($SIZE bytes). The APK exceeds the 10MB Discord upload limit, so download it from the run artifacts: $RUN_URL\"}" \
+              "$DISCORD_WEBHOOK_URL"
+          fi

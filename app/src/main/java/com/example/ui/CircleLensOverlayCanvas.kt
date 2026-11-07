@@ -97,6 +97,9 @@ fun CircleLensOverlayCanvas(
     )
 
     val currentBitmap by rememberUpdatedState(bitmap)
+    // Cache the ImageBitmap wrapper per bitmap so the GPU texture is uploaded once
+    // instead of being re-created (and re-uploaded at full resolution) on every frame.
+    val cachedImageBitmap = remember(bitmap) { bitmap?.asImageBitmap() }
     val currentTextSelection by rememberUpdatedState(textSelection)
     val currentCropSelection by rememberUpdatedState(cropSelection)
     val currentStrokeStart by rememberUpdatedState(onStrokeStart)
@@ -333,7 +336,7 @@ fun CircleLensOverlayCanvas(
             onImageRectCalculated(imageRect)
 
             // Draw underlying screen bitmap
-            val imageBitmap = bitmap.asImageBitmap()
+            val imageBitmap = cachedImageBitmap ?: bitmap.asImageBitmap()
             drawImage(
                 image = imageBitmap,
                 dstOffset = IntOffset(destLeft.toInt(), destTop.toInt()),
