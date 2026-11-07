@@ -56,6 +56,13 @@ jobs:
           KEYSTORE_ALIAS: androiddebugkey
         run: gradle assembleRelease --no-daemon
 
+      - name: Verify APK signature
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+          ls -la "$APK"
+          sha256sum "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$APK"
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
