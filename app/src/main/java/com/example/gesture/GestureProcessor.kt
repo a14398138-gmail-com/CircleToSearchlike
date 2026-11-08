@@ -115,48 +115,67 @@ object GestureProcessor {
     /**
      * Finds token range (startGlobalIdx to endGlobalIdx) covered by user stroke.
      * Uses directional stroke scanning and token intersection.
+     *
+     * Tokens are mapped to display space arithmetically (no RectF per token)
+     * and tokens whose expanded box does not even reach the stroke's bounding
+     * box are skipped before the per-point test.
      */
     fun findTokensInStroke(
         strokePoints: List<Offset>,
         allTokens: List<OcrToken>,
-        imageToDisplayTransform: (Rect) -> RectF
+        mapping: ImageToDisplayMapping
     ): Pair<Int, Int>? {
         if (strokePoints.isEmpty() || allTokens.isEmpty()) return null
 
-        val touchedGlobalIndices = mutableListOf<Int>()
         val tolerance = 32f // Touch tolerance for finger strokes
 
+        var strokeMinX = Float.POSITIVE_INFINITY
+        var strokeMinY = Float.POSITIVE_INFINITY
+        var strokeMaxX = Float.NEGATIVE_INFINITY
+        var strokeMaxY = Float.NEGATIVE_INFINITY
+        for (pt in strokePoints) {
+            if (pt.x < strokeMinX) strokeMinX = pt.x
+            if (pt.x > strokeMaxX) strokeMaxX = pt.x
+            if (pt.y < strokeMinY) strokeMinY = pt.y
+            if (pt.y > strokeMaxY) strokeMaxY = pt.y
+        }
+
+        var minIdx = Int.MAX_VALUE
+        var maxIdx = Int.MIN_VALUE
+
         for (token in allTokens) {
-            val displayBox = imageToDisplayTransform(token.boundingBox)
-            val expanded = RectF(
-                displayBox.left - tolerance,
-                displayBox.top - tolerance,
-                displayBox.right + tolerance,
-                displayBox.bottom + tolerance
-            )
+            val box = token.boundingBox
+            val left = mapping.toDisplayX(box.left) - tolerance
+            val top = mapping.toDisplayY(box.top) - tolerance
+            val right = mapping.toDisplayX(box.right) + tolerance
+            val bottom = mapping.toDisplayY(box.bottom) + tolerance
+
+            // Same semantics as RectF.contains(): non-empty, half-open on right/bottom.
+            if (left >= right || top >= bottom) continue
+            if (right <= strokeMinX || left > strokeMaxX || bottom <= strokeMinY || top > strokeMaxY) continue
+
             for (pt in strokePoints) {
-                if (expanded.contains(pt.x, pt.y)) {
-                    touchedGlobalIndices.add(token.globalIndex)
+                if (pt.x >= left && pt.x < right && pt.y >= top && pt.y < bottom) {
+                    if (token.globalIndex < minIdx) minIdx = token.globalIndex
+                    if (token.globalIndex > maxIdx) maxIdx = token.globalIndex
                     break
                 }
             }
         }
 
-        if (touchedGlobalIndices.isEmpty()) return null
-
-        val minIdx = touchedGlobalIndices.minOrNull() ?: return null
-        val maxIdx = touchedGlobalIndices.maxOrNull() ?: return null
+        if (minIdx == Int.MAX_VALUE) return null
         return Pair(minIdx, maxIdx)
     }
 
     /**
      * Finds the token closest to a given display point with continuous 2D distance mapping
      * to provide fluid pin dragging across arbitrary characters, words, and lines.
+     * Called for every pointer move while a pin is dragged, so it allocates nothing.
      */
     fun findClosestToken(
         point: Offset,
         allTokens: List<OcrToken>,
-        imageToDisplayTransform: (Rect) -> RectF
+        mapping: ImageToDisplayMapping
     ): OcrToken? {
         if (allTokens.isEmpty()) return null
 
@@ -164,20 +183,24 @@ object GestureProcessor {
         var minScore = Float.MAX_VALUE
 
         for (token in allTokens) {
-            val displayBox = imageToDisplayTransform(token.boundingBox)
+            val box = token.boundingBox
+            val left = mapping.toDisplayX(box.left)
+            val top = mapping.toDisplayY(box.top)
+            val right = mapping.toDisplayX(box.right)
+            val bottom = mapping.toDisplayY(box.bottom)
 
             // Vertical distance with comfortable line snap band
             val vDist = when {
-                point.y in (displayBox.top - 8f)..(displayBox.bottom + 8f) -> 0f
-                point.y < displayBox.top -> displayBox.top - point.y
-                else -> point.y - displayBox.bottom
+                point.y >= top - 8f && point.y <= bottom + 8f -> 0f
+                point.y < top -> top - point.y
+                else -> point.y - bottom
             }
 
             // Horizontal distance to box edge
             val hDist = when {
-                point.x in displayBox.left..displayBox.right -> 0f
-                point.x < displayBox.left -> displayBox.left - point.x
-                else -> point.x - displayBox.right
+                point.x >= left && point.x <= right -> 0f
+                point.x < left -> left - point.x
+                else -> point.x - right
             }
 
             // Strongly favor the line the finger is currently on (vertical weight 2.2x)
@@ -193,3 +216,33 @@ object GestureProcessor {
     }
 }
 
+/**
+ * Bitmap-to-display coordinate mapping for the fitted screenshot, matching
+ * `RectF(rect.left + box.left * scaleX, rect.top + box.top * scaleY, ...)`.
+ */
+class ImageToDisplayMapping(
+    private val left: Float,
+    private val top: Float,
+    private val scaleX: Float,
+    private val scaleY: Float
+) {
+    fun toDisplayX(bitmapX: Int): Float = left + bitmapX * scaleX
+    fun toDisplayY(bitmapY: Int): Float = top + bitmapY * scaleY
+
+    fun toDisplayRect(box: Rect): RectF = RectF(
+        toDisplayX(box.left),
+        toDisplayY(box.top),
+        toDisplayX(box.right),
+        toDisplayY(box.bottom)
+    )
+
+    companion object {
+        fun of(imageRectOnDisplay: RectF, bitmapWidth: Int, bitmapHeight: Int): ImageToDisplayMapping =
+            ImageToDisplayMapping(
+                left = imageRectOnDisplay.left,
+                top = imageRectOnDisplay.top,
+                scaleX = imageRectOnDisplay.width() / bitmapWidth,
+                scaleY = imageRectOnDisplay.height() / bitmapHeight
+            )
+    }
+}

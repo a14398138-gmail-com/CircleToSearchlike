@@ -80,9 +80,7 @@ object ScreenshotHelper {
 
                     if (isRecent || isScreenshotName) {
                         val contentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-                        context.contentResolver.openInputStream(contentUri)?.use { input ->
-                            return@withContext BitmapFactory.decodeStream(input)
-                        }
+                        return@withContext decodeSampledBitmap(context, contentUri)
                     }
                 }
             }
@@ -91,4 +89,33 @@ object ScreenshotHelper {
         }
         null
     }
+
+    /**
+     * Decodes [uri] subsampled (power-of-two inSampleSize) so the bitmap holds at
+     * most about twice the display's pixel count. Gallery images and shared
+     * photos are often 12-50MP: decoding them at full size cost hundreds of
+     * milliseconds and 50-200MB, although the image is only shown fitted to
+     * the screen and OCR downscales to 1080px anyway. Blocking; call on IO.
+     */
+    fun decodeSampledBitmap(context: Context, uri: Uri): Bitmap? {
+        val resolver = context.contentResolver
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+
+        val metrics = context.resources.displayMetrics
+        val pixelBudget = (metrics.widthPixels.toLong() * metrics.heightPixels.toLong() * 2L)
+            .coerceAtLeast(MIN_PIXEL_BUDGET)
+        var sampleSize = 1
+        if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+            val pixels = bounds.outWidth.toLong() * bounds.outHeight.toLong()
+            while (pixels / (sampleSize.toLong() * sampleSize) > pixelBudget) {
+                sampleSize *= 2
+            }
+        }
+
+        val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        return resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+    }
+
+    private const val MIN_PIXEL_BUDGET = 4_000_000L
 }

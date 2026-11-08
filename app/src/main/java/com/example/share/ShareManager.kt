@@ -45,11 +45,22 @@ class ShareManager private constructor(context: Context) {
     private val _recentImageShareTargets = MutableStateFlow<List<ShareTarget>>(emptyList())
     val recentImageShareTargets: StateFlow<List<ShareTarget>> = _recentImageShareTargets.asStateFlow()
 
+    // Declared before init: loadPersistedTargets() reads them.
+    private val availableTargetsCache =
+        java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<ShareTarget>>>()
+
+    /** Icons are shown at <= 36dp; rendering adaptive icons at their 108dp intrinsic size wasted memory and time. */
+    private val maxIconSizePx: Int =
+        (ICON_MAX_SIZE_DP * appContext.resources.displayMetrics.density).toInt().coerceAtLeast(48)
+
     init {
         loadPersistedTargets()
     }
 
     companion object {
+        private const val AVAILABLE_TARGETS_TTL_MS = 5 * 60 * 1000L
+        private const val ICON_MAX_SIZE_DP = 48
+
         @Volatile
         private var instance: ShareManager? = null
 
@@ -61,8 +72,12 @@ class ShareManager private constructor(context: Context) {
     }
 
     private fun loadPersistedTargets() {
-        val availableText = getAvailableShareTargets("text/plain")
-        val availableImg = getAvailableShareTargets("image/*")
+        // The full share-target query (queryIntentActivities + label + icon for
+        // every installed share target) is only needed as a fallback when no
+        // history exists yet. It used to run unconditionally, twice, on every
+        // process start, which dominated cold-start time.
+        val availableText by lazy { getAvailableShareTargets("text/plain") }
+        val availableImg by lazy { getAvailableShareTargets("image/*") }
 
         // Load Text History
         val textHistoryRaw = prefs.getString("recent_text_history", null)
@@ -85,7 +100,7 @@ class ShareManager private constructor(context: Context) {
             textTargets.addAll(availableText.take(5))
         }
         _recentTextShareTargets.value = textTargets
-        _lastTextShareTarget.value = textTargets.firstOrNull() ?: availableText.firstOrNull()
+        _lastTextShareTarget.value = textTargets.firstOrNull()
 
         // Load Image History
         val imgHistoryRaw = prefs.getString("recent_img_history", null)
@@ -108,10 +123,28 @@ class ShareManager private constructor(context: Context) {
             imgTargets.addAll(availableImg.take(5))
         }
         _recentImageShareTargets.value = imgTargets
-        _lastImageShareTarget.value = imgTargets.firstOrNull() ?: availableImg.firstOrNull()
+        _lastImageShareTarget.value = imgTargets.firstOrNull()
     }
 
-    fun getAvailableShareTargets(mimeType: String): List<ShareTarget> {
+    /**
+     * Returns every activity that accepts ACTION_SEND for [mimeType].
+     * Results are cached per MIME type for [AVAILABLE_TARGETS_TTL_MS]: the
+     * query loads a label and an icon for every share target on the device,
+     * and it is needed by several call sites (fallback history, history
+     * entries that no longer resolve, the target picker).
+     */
+    fun getAvailableShareTargets(mimeType: String, forceRefresh: Boolean = false): List<ShareTarget> {
+        if (!forceRefresh) {
+            availableTargetsCache[mimeType]?.let { (loadedAt, targets) ->
+                if (System.currentTimeMillis() - loadedAt < AVAILABLE_TARGETS_TTL_MS) return targets
+            }
+        }
+        val targets = queryAvailableShareTargets(mimeType)
+        availableTargetsCache[mimeType] = System.currentTimeMillis() to targets
+        return targets
+    }
+
+    private fun queryAvailableShareTargets(mimeType: String): List<ShareTarget> {
         val pm = appContext.packageManager
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = mimeType
@@ -128,8 +161,11 @@ class ShareManager private constructor(context: Context) {
         }
 
         val myPkg = appContext.packageName
+        val seen = HashSet<String>()
         return resolveInfos
             .filter { it.activityInfo.packageName != myPkg }
+            // De-duplicate before loading labels/icons instead of after.
+            .filter { seen.add("${it.activityInfo.packageName}/${it.activityInfo.name}") }
             .map { ri ->
                 val pkgName = ri.activityInfo.packageName
                 val actName = ri.activityInfo.name
@@ -144,7 +180,6 @@ class ShareManager private constructor(context: Context) {
                     iconBitmap = iconBmp?.asImageBitmap()
                 )
             }
-            .distinctBy { "${it.packageName}/${it.activityName}" }
     }
 
     private fun resolveTarget(packageName: String, activityName: String?, mimeType: String): ShareTarget? {
@@ -387,8 +422,14 @@ class ShareManager private constructor(context: Context) {
             if (drawable is BitmapDrawable && drawable.bitmap != null) {
                 return drawable.bitmap
             }
-            val width = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 96
-            val height = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 96
+            var width = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 96
+            var height = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 96
+            val largest = maxOf(width, height)
+            if (largest > maxIconSizePx) {
+                val ratio = maxIconSizePx.toFloat() / largest
+                width = (width * ratio).toInt().coerceAtLeast(1)
+                height = (height * ratio).toInt().coerceAtLeast(1)
+            }
             val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(bitmap)
             drawable.setBounds(0, 0, canvas.width, canvas.height)

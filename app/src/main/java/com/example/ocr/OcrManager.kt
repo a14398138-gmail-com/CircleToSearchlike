@@ -12,8 +12,6 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -22,6 +20,11 @@ import kotlin.math.max
 import kotlin.math.min
 
 class OcrManager {
+
+    private companion object {
+        val WHITESPACE = Regex("\\s+")
+        const val WARM_UP_TIMEOUT_MS = 5_000L
+    }
 
     private val japaneseRecognizer by lazy {
         try {
@@ -36,34 +39,42 @@ class OcrManager {
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     }
 
+    @Volatile
+    private var latinWarmUpStarted = false
+
     /**
-     * Pre-warms both ML Kit OCR engines by processing a tiny dummy image in background.
-     * This loads the neural network weights, TFLite delegates, and native libraries into memory
-     * so that the user's first actual screen OCR executes with zero cold-start delay.
+     * Pre-warms the primary (Japanese) ML Kit engine by processing a tiny dummy
+     * image, so the model weights, TFLite delegates and native libraries are
+     * loaded before the user's first real screen OCR.
+     *
+     * The Latin engine is only a fallback (Japanese timed out / failed). It is
+     * no longer warmed up here: loading its model in parallel competed for CPU
+     * and I/O with the Japanese model load and the first real recognition on
+     * cold start. It is warmed up after the first real recognition instead
+     * (see [warmUpLatinInBackground]).
      */
     suspend fun warmUp() = withContext(Dispatchers.Default) {
         try {
-            val dummyBmp = Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888)
-            val dummyImage = InputImage.fromBitmap(dummyBmp, 0)
-            coroutineScope {
-                async {
-                    try {
-                        japaneseRecognizer.process(dummyImage)
-                    } catch (e: Throwable) {
-                        Log.w("OcrManager", "Japanese warm-up warning", e)
-                    }
-                }
-                async {
-                    try {
-                        latinRecognizer.process(dummyImage)
-                    } catch (e: Throwable) {
-                        Log.w("OcrManager", "Latin warm-up warning", e)
-                    }
-                }
+            val dummyImage = InputImage.fromBitmap(Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888), 0)
+            val done = withTimeoutOrNull(WARM_UP_TIMEOUT_MS) {
+                runMlKitRecognition(japaneseRecognizer, dummyImage, 1f)
             }
-            Log.d("OcrManager", "OCR engine pre-warmed successfully")
+            Log.d("OcrManager", if (done != null) "OCR engine pre-warmed" else "OCR warm-up did not complete (timed out or failed)")
         } catch (e: Throwable) {
             Log.w("OcrManager", "OCR warm-up exception", e)
+        }
+    }
+
+    /** Fire-and-forget Latin model load, started once after the first real recognition. */
+    private fun warmUpLatinInBackground() {
+        if (latinWarmUpStarted) return
+        latinWarmUpStarted = true
+        try {
+            val dummyImage = InputImage.fromBitmap(Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888), 0)
+            latinRecognizer.process(dummyImage)
+                .addOnFailureListener { Log.w("OcrManager", "Latin warm-up warning", it) }
+        } catch (e: Throwable) {
+            Log.w("OcrManager", "Latin warm-up exception", e)
         }
     }
 
@@ -124,23 +135,28 @@ class OcrManager {
         }
 
         try {
-            // Attempt Japanese recognizer with a strict 2.5-second timeout
+            // Attempt Japanese recognizer with a strict 2.5-second timeout.
+            // null = timed out or failed; an empty list = no text on screen.
             val japaneseResult = withTimeoutOrNull(2500L) {
                 runMlKitRecognition(japaneseRecognizer, inputImage, scaleRatio)
             }
 
-            if (japaneseResult != null && japaneseResult.isNotEmpty()) {
+            if (japaneseResult != null) {
+                // The Japanese model also reads Latin script (same detector), so a
+                // successful empty result means there is no text: running the
+                // Latin model as well only delayed the "no text" state.
+                warmUpLatinInBackground()
                 return@withContext japaneseResult
             }
 
-            Log.w("OcrManager", "Japanese recognition timed out or returned empty, falling back to Latin recognizer")
+            Log.w("OcrManager", "Japanese recognition timed out or failed, falling back to Latin recognizer")
 
             // Fallback to Latin recognizer with a 1.5-second timeout
             val latinResult = withTimeoutOrNull(1500L) {
                 runMlKitRecognition(latinRecognizer, inputImage, scaleRatio)
             }
 
-            latinResult ?: emptyList()
+            latinResult.orEmpty()
         } finally {
             if (isScaled && inferenceBitmap != bitmap && inferenceBitmap != safeBitmap) {
                 try { inferenceBitmap.recycle() } catch (_: Throwable) {}
@@ -151,11 +167,12 @@ class OcrManager {
         }
     }
 
+    /** Recognized lines, or null when ML Kit reported a failure. */
     private suspend fun runMlKitRecognition(
         recognizer: com.google.mlkit.vision.text.TextRecognizer,
         inputImage: InputImage,
         scaleRatio: Float
-    ): List<OcrTextItem> = suspendCancellableCoroutine { continuation ->
+    ): List<OcrTextItem>? = suspendCancellableCoroutine { continuation ->
         recognizer.process(inputImage)
             .addOnSuccessListener { visionText ->
                 if (continuation.isActive) {
@@ -171,7 +188,7 @@ class OcrManager {
             .addOnFailureListener { error ->
                 Log.w("OcrManager", "ML Kit process failure", error)
                 if (continuation.isActive) {
-                    continuation.resume(emptyList())
+                    continuation.resume(null)
                 }
             }
     }
@@ -289,7 +306,7 @@ class OcrManager {
                         )
                     }
                 } else {
-                    val words = lineText.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                    val words = lineText.split(WHITESPACE).filter { it.isNotEmpty() }
                     val totalLen = lineText.length.coerceAtLeast(1)
                     var currentOffset = 0
                     for (word in words) {
@@ -358,6 +375,13 @@ class OcrManager {
         )
 
         val rows = mutableListOf<MutableList<Text.Line>>()
+        // Running vertical span of each row's boxed lines. The old code recomputed
+        // it with minOf/maxOf over the whole row for every candidate line
+        // (O(n^2)); a box-less member fell back to the candidate's own top/bottom,
+        // which is reproduced through rowHasBoxless below.
+        val rowTops = mutableListOf<Int>()
+        val rowBottoms = mutableListOf<Int>()
+        val rowHasBoxless = mutableListOf<Boolean>()
 
         for (line in sortedByTop) {
             val box = line.boundingBox ?: Rect(0, 0, 0, 0)
@@ -366,11 +390,11 @@ class OcrManager {
             val height = (bottom - top).coerceAtLeast(1)
             val centerY = (top + bottom) / 2
 
-            var matchedRow: MutableList<Text.Line>? = null
+            var matchedRow = -1
 
-            for (row in rows) {
-                val rTop = row.minOf { it.boundingBox?.top ?: top }
-                val rBottom = row.maxOf { it.boundingBox?.bottom ?: bottom }
+            for (r in rows.indices) {
+                val rTop = if (rowHasBoxless[r]) min(rowTops[r], top) else rowTops[r]
+                val rBottom = if (rowHasBoxless[r]) max(rowBottoms[r], bottom) else rowBottoms[r]
                 val rHeight = (rBottom - rTop).coerceAtLeast(1)
 
                 val overlapY = max(0, min(bottom, rBottom) - max(top, rTop))
@@ -378,15 +402,25 @@ class OcrManager {
 
                 // Overlap by at least 40% of line height or vertical center inside row span
                 if (overlapRatio >= 0.40f || (centerY in rTop..rBottom)) {
-                    matchedRow = row
+                    matchedRow = r
                     break
                 }
             }
 
-            if (matchedRow != null) {
-                matchedRow.add(line)
+            val hasBox = line.boundingBox != null
+            if (matchedRow >= 0) {
+                rows[matchedRow].add(line)
+                if (hasBox) {
+                    rowTops[matchedRow] = min(rowTops[matchedRow], top)
+                    rowBottoms[matchedRow] = max(rowBottoms[matchedRow], bottom)
+                } else {
+                    rowHasBoxless[matchedRow] = true
+                }
             } else {
                 rows.add(mutableListOf(line))
+                rowTops.add(if (hasBox) top else Int.MAX_VALUE)
+                rowBottoms.add(if (hasBox) bottom else Int.MIN_VALUE)
+                rowHasBoxless.add(!hasBox)
             }
         }
 
