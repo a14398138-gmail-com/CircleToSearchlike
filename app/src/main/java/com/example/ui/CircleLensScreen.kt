@@ -1,6 +1,9 @@
 package com.example.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.graphics.RectF
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -34,6 +37,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.translate.TranslateController
 import kotlin.math.max
@@ -71,6 +75,24 @@ fun CircleLensScreen(
                 translateController.importModel(uri)
                 modelPickTick++
             }
+        }
+    }
+
+    // Android 7-9 need WRITE_EXTERNAL_STORAGE to save into Download;
+    // Android 10+ save through MediaStore without any permission.
+    val storagePermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) viewModel.saveCroppedImage()
+    }
+    val saveCroppedImage: () -> Unit = {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+            ContextCompat.checkSelfPermission(appContext, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            storagePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            viewModel.saveCroppedImage()
         }
     }
 
@@ -271,7 +293,8 @@ fun CircleLensScreen(
                         if (bmp != null) {
                             viewModel.ocrInsideCrop(displayImageRect, bmp.width, bmp.height)
                         }
-                    }
+                    },
+                    onSaveImage = saveCroppedImage
                 )
             }
         }

@@ -676,6 +676,20 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    /**
+     * Saves the crop straight to the Download folder (no app switch, unlike
+     * sharing to Files by Google) and then closes the overlay like a share does.
+     */
+    fun saveCroppedImage() {
+        val crop = _uiState.value.activeCropSelection ?: return
+        viewModelScope.launch {
+            val cropBmp = cropBitmapFor(crop) ?: return@launch
+            if (shareManager.saveImageToDownloads(cropBmp)) {
+                closeAppEvent.emit(Unit)
+            }
+        }
+    }
+
     fun copyCroppedImage() {
         val crop = _uiState.value.activeCropSelection ?: return
         viewModelScope.launch {

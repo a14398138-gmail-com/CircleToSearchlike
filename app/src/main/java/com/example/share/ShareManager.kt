@@ -4,6 +4,7 @@ import android.app.PendingIntent
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -13,8 +14,11 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
 import android.widget.Toast
 import androidx.compose.ui.graphics.asAndroidBitmap
@@ -32,6 +36,9 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 
 class ShareManager private constructor(context: Context) {
@@ -511,6 +518,83 @@ class ShareManager private constructor(context: Context) {
             Toast.makeText(appContext, "画像をクリップボードにコピーしました", Toast.LENGTH_SHORT).show()
         }
         true
+    }
+
+    /**
+     * Saves [bitmap] as a PNG in the device's Download folder without leaving
+     * the app (the share sheet route through e.g. Files by Google always opens
+     * that app's own screen). Shows a toast and returns whether it was saved.
+     *
+     * Android 10+ writes through MediaStore and needs no permission; on
+     * Android 7-9 the caller must hold WRITE_EXTERNAL_STORAGE.
+     */
+    suspend fun saveImageToDownloads(bitmap: Bitmap): Boolean = withContext(Dispatchers.IO) {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val fileName = "CircleOCR_$stamp.png"
+        val saved = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                saveToDownloadsMediaStore(bitmap, fileName)
+            } else {
+                saveToDownloadsLegacy(bitmap, fileName)
+            }
+        } catch (e: Throwable) {
+            Log.e("ShareManager", "Failed to save image to Downloads", e)
+            false
+        }
+        withContext(Dispatchers.Main) {
+            Toast.makeText(
+                appContext,
+                if (saved) "ダウンロードに保存しました" else "画像を保存できませんでした",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+        saved
+    }
+
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.Q)
+    private fun saveToDownloadsMediaStore(bitmap: Bitmap, fileName: String): Boolean {
+        val resolver = appContext.contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/png")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            // Hidden from other apps until the PNG is completely written.
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return false
+        try {
+            val written = resolver.openOutputStream(uri)?.use { out ->
+                java.io.BufferedOutputStream(out, 32768).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            } ?: false
+            if (!written) {
+                resolver.delete(uri, null, null)
+                return false
+            }
+            resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            return true
+        } catch (e: Throwable) {
+            resolver.delete(uri, null, null)
+            throw e
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun saveToDownloadsLegacy(bitmap: Bitmap, fileName: String): Boolean {
+        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        if (!dir.exists() && !dir.mkdirs()) return false
+        var file = File(dir, fileName)
+        var n = 1
+        while (file.exists()) file = File(dir, fileName.removeSuffix(".png") + " ($n).png").also { n++ }
+        val written = java.io.BufferedOutputStream(FileOutputStream(file), 32768).use { out ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+        }
+        if (!written) {
+            file.delete()
+            return false
+        }
+        // Make it show up in Files / Photos right away.
+        MediaScannerConnection.scanFile(appContext, arrayOf(file.absolutePath), arrayOf("image/png"), null)
+        return true
     }
 
     private fun saveBitmapToCache(bitmap: Bitmap, filename: String, subDir: String): Uri? {
