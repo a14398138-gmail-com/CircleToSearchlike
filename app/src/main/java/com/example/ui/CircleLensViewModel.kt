@@ -110,6 +110,9 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
     /** Bitmap whose OCR is running or whose results are in [uiState]. */
     private var ocrBitmap: Bitmap? = null
 
+    /** Id of the last assistant screenshot loaded (declared before init, which uses it). */
+    private var lastLoadedScreenshotId: Long = 0L
+
     init {
         // Share targets: one IO initialisation inside ShareManager (its
         // constructor does no PackageManager/icon work). Its flows are only
@@ -152,12 +155,16 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
             ocrManager.warmUp()
         }
 
-        // Single screenshot consumer path: only this method ever loads a
-        // pending screenshot, and each screenshot id is loaded at most once.
-        loadPendingScreenshotIfNew()
+        // Single screenshot consumer path: only loadPendingScreenshotIfNew()
+        // ever loads a pending screenshot, and each screenshot id is loaded at
+        // most once. Collecting the holder also picks up a screenshot that
+        // arrives after the overlay was opened without one.
+        viewModelScope.launch {
+            CircleLensScreenshotHolder.pendingIds.collect { id ->
+                if (id != 0L) loadPendingScreenshotIfNew()
+            }
+        }
     }
-
-    private var lastLoadedScreenshotId: Long = 0L
 
     /**
      * The one and only entry point for assistant screenshots. Lifecycle
@@ -199,6 +206,9 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
             loadPendingScreenshotIfNew()
             return
         }
+        // A screenshot is being recognized already: a repeated launch intent
+        // must not cancel its OCR (that left the overlay stuck in "OCR running").
+        if (ocrBitmap != null && activeLoadJob?.isActive == true) return
 
         activeLoadJob?.cancel()
         activeLoadJob = viewModelScope.launch {

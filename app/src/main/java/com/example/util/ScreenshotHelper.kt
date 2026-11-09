@@ -11,6 +11,9 @@ import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicLong
 
@@ -34,10 +37,20 @@ object CircleLensScreenshotHolder {
     private var pendingId: Long = 0L
     private val idSeq = AtomicLong(0L)
 
+    private val _pendingIds = MutableStateFlow(0L)
+
+    /**
+     * Id of the latest screenshot handed over (0 = none yet). Lets an overlay
+     * that is already open load a screenshot that arrived after it was
+     * launched (the assist session opens it without one after a timeout).
+     */
+    val pendingIds: StateFlow<Long> = _pendingIds.asStateFlow()
+
     @Synchronized
     fun setScreenshot(bitmap: Bitmap) {
         pendingScreenshot = bitmap
         pendingId = idSeq.incrementAndGet()
+        _pendingIds.value = pendingId
     }
 
     /** Returns (id, bitmap) of the pending screenshot without consuming it. */
