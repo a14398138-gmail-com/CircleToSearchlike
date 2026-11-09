@@ -1,26 +1,31 @@
 package com.example.ui
 
 import android.graphics.Bitmap
-import android.graphics.Rect
 import android.graphics.RectF
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -33,7 +38,10 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import com.example.model.CropSelection
@@ -76,25 +84,23 @@ fun CircleLensOverlayCanvas(
     onCropFrameUpdated: (RectF, RectF) -> Unit,
     onImageRectCalculated: (RectF) -> Unit
 ) {
-    val infiniteTransition = rememberInfiniteTransition(label = "auroraGlow")
-    val phase by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(2000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "dashPhase"
-    )
-    val pulsePhase by infiniteTransition.animateFloat(
-        initialValue = 0.88f,
-        targetValue = 1.12f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(2200, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulsePhase"
-    )
+    // Aurora animation runs ONLY while the user is interacting (an active
+    // stroke, a text selection, or a crop frame); an idle screen does not
+    // redraw. The values are passed down as State and only read inside the
+    // layers' draw lambdas, so while animating nothing recomposes either.
+    val auroraActive = activeStrokePoints.isNotEmpty() || textSelection != null || cropSelection != null
+    val phaseAnim = remember { Animatable(0f) }
+    val pulseAnim = remember { Animatable(0.88f) }
+    LaunchedEffect(auroraActive) {
+        if (auroraActive) {
+            launchPhases(phaseAnim, pulseAnim)
+        } else {
+            phaseAnim.snapTo(0f)
+            pulseAnim.snapTo(0.88f)
+        }
+    }
+    val phase = phaseAnim.asState()
+    val pulsePhase = pulseAnim.asState()
 
     val currentBitmap by rememberUpdatedState(bitmap)
     val currentTextSelection by rememberUpdatedState(textSelection)
@@ -105,16 +111,34 @@ fun CircleLensOverlayCanvas(
     val currentDragStartPin by rememberUpdatedState(onDragStartPin)
     val currentDragEndPin by rememberUpdatedState(onDragEndPin)
     val currentCropFrameUpdated by rememberUpdatedState(onCropFrameUpdated)
+    val currentImageRectCalculated by rememberUpdatedState(onImageRectCalculated)
 
-    var currentDisplayImageRect by remember { mutableStateOf(RectF()) }
+    // The fitted image rect is derived from the layout size instead of being
+    // written to state from inside the draw pass on every frame.
+    var canvasSize by remember { mutableStateOf(IntSize.Zero) }
+    val bitmapWidth = bitmap?.width ?: 0
+    val bitmapHeight = bitmap?.height ?: 0
+    val fittedImageRect: RectF? = remember(canvasSize, bitmapWidth, bitmapHeight) {
+        if (bitmapWidth <= 0 || bitmapHeight <= 0 || canvasSize.width <= 0 || canvasSize.height <= 0) {
+            null
+        } else {
+            fitImage(canvasSize.width.toFloat(), canvasSize.height.toFloat(), bitmapWidth, bitmapHeight).rect
+        }
+    }
+    val currentDisplayImageRect by rememberUpdatedState(fittedImageRect ?: EMPTY_RECT)
+    SideEffect {
+        fittedImageRect?.let { currentImageRectCalculated(it) }
+    }
+
     var currentDragTarget by remember { mutableStateOf(DragTarget.NONE) }
     var activeCropHandle by remember { mutableStateOf(CropHandleType.NONE) }
     var dragStartCropRect by remember { mutableStateOf(RectF()) }
     var dragStartTouch by remember { mutableStateOf(Offset.Zero) }
 
-    Canvas(
+    Box(
         modifier = modifier
             .fillMaxSize()
+            .onSizeChanged { canvasSize = it }
             .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
@@ -315,302 +339,373 @@ fun CircleLensOverlayCanvas(
                 }
             }
     ) {
-        val canvasWidth = size.width
-        val canvasHeight = size.height
-
         if (bitmap != null) {
-            val bmpWidth = bitmap.width.toFloat()
-            val bmpHeight = bitmap.height.toFloat()
+            // Each layer is its own RenderNode (graphicsLayer), so it is only
+            // re-recorded when its own inputs change. Previously everything —
+            // screenshot, OCR boxes, selection, gradients — was re-recorded on
+            // every animation frame (60fps) and on every stroke point.
+            ScreenshotLayer(bitmap)
+            AuroraLayer(bitmapWidth, bitmapHeight, pulsePhase)
+            OcrSelectionLayer(bitmapWidth, bitmapHeight, ocrItems, textSelection)
+            if (cropSelection != null) {
+                CropLayer(bitmapWidth, bitmapHeight, cropSelection, phase)
+            }
+            if (activeStrokePoints.size > 1 || trailPoints.isNotEmpty()) {
+                StrokeLayer(activeStrokePoints, trailPoints)
+            }
+        }
+    }
+}
 
-            val scale = min(canvasWidth / bmpWidth, canvasHeight / bmpHeight)
-            val destWidth = bmpWidth * scale
-            val destHeight = bmpHeight * scale
-            val destLeft = (canvasWidth - destWidth) / 2f
-            val destTop = (canvasHeight - destHeight) / 2f
+/** Screenshot fitted (centered, aspect preserved) into the canvas. */
+private class FittedImage(val left: Float, val top: Float, val width: Float, val height: Float) {
+    val rect: RectF get() = RectF(left, top, left + width, top + height)
+}
 
-            val imageRect = RectF(destLeft, destTop, destLeft + destWidth, destTop + destHeight)
-            currentDisplayImageRect = imageRect
-            onImageRectCalculated(imageRect)
+private fun fitImage(canvasWidth: Float, canvasHeight: Float, bitmapWidth: Int, bitmapHeight: Int): FittedImage {
+    val bmpWidth = bitmapWidth.toFloat()
+    val bmpHeight = bitmapHeight.toFloat()
+    val scale = min(canvasWidth / bmpWidth, canvasHeight / bmpHeight)
+    val destWidth = bmpWidth * scale
+    val destHeight = bmpHeight * scale
+    val destLeft = (canvasWidth - destWidth) / 2f
+    val destTop = (canvasHeight - destHeight) / 2f
+    return FittedImage(destLeft, destTop, destWidth, destHeight)
+}
 
-            // Draw underlying screen bitmap
-            val imageBitmap = bitmap.asImageBitmap()
-            drawImage(
-                image = imageBitmap,
-                dstOffset = IntOffset(destLeft.toInt(), destTop.toInt()),
-                dstSize = IntSize(destWidth.toInt(), destHeight.toInt())
+private val EMPTY_RECT = RectF()
+
+private val ScrimColor = Color(0x38000000)
+private val OcrHintColor = Color(0x1560A5FA)
+private val CropVignetteColor = Color(0x40000000)
+private val TrailColor = Color(0xFF67E8F9)
+
+// Brushes are hoisted: the old code allocated a new gradient brush (and
+// shader) per selected token per frame. A horizontalGradient without explicit
+// bounds spans the DrawScope width, so a single shared instance is identical.
+private val SelectionHighlightBrush = Brush.horizontalGradient(
+    listOf(Color(0xB81D4ED8), Color(0xCC2563EB))
+)
+private val StrokeAuraBrush = Brush.horizontalGradient(
+    listOf(Color(0x9938BDF8), Color(0xCC818CF8), Color(0x99F472B6))
+)
+private val AuroraTopLeftColors = listOf(
+    Color(0x8C2563EB), Color(0x6638BDF8), Color(0x3360A5FA), Color(0x1038BDF8), Color(0x002563EB)
+)
+private val AuroraTopRightColors = listOf(
+    Color(0x90F59E0B), Color(0x66EAB308), Color(0x33F97316), Color(0x10F59E0B), Color(0x00F59E0B)
+)
+private val AuroraBottomRightColors = listOf(
+    Color(0x8C10B981), Color(0x6014B8A6), Color(0x30059669), Color(0x1010B981), Color(0x0010B981)
+)
+private val AuroraBottomLeftColors = listOf(
+    Color(0x7506B6D4), Color(0x4D10B981), Color(0x2038BDF8), Color(0x0006B6D4)
+)
+private val AuroraBorderColors = listOf(
+    Color(0xFF38BDF8), Color(0xFFF59E0B), Color(0xFF10B981), Color(0xFF06B6D4), Color(0xFF38BDF8)
+)
+private val CropBorderColors = listOf(
+    Color(0xFF38BDF8), Color(0xFF818CF8), Color(0xFFF472B6), Color(0xFFFBBF24), Color(0xFF38BDF8)
+)
+private val CropDashIntervals = floatArrayOf(30f, 15f)
+
+/** Static layer: the screenshot plus the dark scrim. Re-recorded only when the bitmap or size changes. */
+@Composable
+private fun ScreenshotLayer(bitmap: Bitmap) {
+    val imageBitmap = remember(bitmap) { bitmap.asImageBitmap() }
+    Canvas(modifier = Modifier.fillMaxSize().graphicsLayer {}) {
+        val fit = fitImage(size.width, size.height, bitmap.width, bitmap.height)
+
+        // Draw underlying screen bitmap
+        drawImage(
+            image = imageBitmap,
+            dstOffset = IntOffset(fit.left.toInt(), fit.top.toInt()),
+            dstSize = IntSize(fit.width.toInt(), fit.height.toInt())
+        )
+
+        // Dark translucent scrim for authentic Circle to Search aesthetic
+        drawRect(
+            color = ScrimColor,
+            topLeft = Offset(fit.left, fit.top),
+            size = Size(fit.width, fit.height)
+        )
+    }
+}
+
+/**
+ * Animated layer: organic misty aurora glow ("もやもや" effect) and border.
+ * The gradient brushes are built once per size; the pulsing radius is applied
+ * as a scale around each blob's centre (a radial gradient scaled about its
+ * centre is the same gradient with a scaled radius), so no brush or shader is
+ * allocated per animation frame.
+ */
+@Composable
+private fun AuroraLayer(bitmapWidth: Int, bitmapHeight: Int, pulsePhase: State<Float>) {
+    Spacer(
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer {}
+            .drawWithCache {
+                val fit = fitImage(size.width, size.height, bitmapWidth, bitmapHeight)
+                val baseRadius = max(fit.width, fit.height) * 0.55f
+
+                val tlCenter = Offset(fit.left + fit.width * 0.05f, fit.top + fit.height * 0.08f)
+                val trCenter = Offset(fit.left + fit.width * 0.96f, fit.top + fit.height * 0.32f)
+                val brCenter = Offset(fit.left + fit.width * 0.88f, fit.top + fit.height * 0.90f)
+                val blCenter = Offset(fit.left + fit.width * 0.12f, fit.top + fit.height * 0.88f)
+
+                val tlBrush = Brush.radialGradient(AuroraTopLeftColors, center = tlCenter, radius = baseRadius)
+                val trBrush = Brush.radialGradient(AuroraTopRightColors, center = trCenter, radius = baseRadius)
+                val brBrush = Brush.radialGradient(AuroraBottomRightColors, center = brCenter, radius = baseRadius)
+                val blBrush = Brush.radialGradient(AuroraBottomLeftColors, center = blCenter, radius = baseRadius)
+
+                // Outer border line connecting the aurora colors
+                val borderBrush = Brush.sweepGradient(
+                    colors = AuroraBorderColors,
+                    center = Offset(size.width / 2f, size.height / 2f)
+                )
+                val borderStroke = Stroke(width = 3.5f)
+
+                onDrawBehind {
+                    val pulse = pulsePhase.value
+                    // Top-Left Cyan / Sky Blue Misty Blob
+                    drawAuroraBlob(tlBrush, tlCenter, pulse, fit)
+                    // Right-side & Top-Right Warm Amber / Gold Misty Blob
+                    drawAuroraBlob(trBrush, trCenter, 2.1f - pulse, fit)
+                    // Bottom-Right / Bottom Emerald Green & Teal Misty Blob
+                    drawAuroraBlob(brBrush, brCenter, pulse, fit)
+                    // Bottom-Left Cyan / Teal Misty Blob
+                    drawAuroraBlob(blBrush, blCenter, 2.05f - pulse, fit)
+
+                    drawRect(
+                        brush = borderBrush,
+                        topLeft = Offset(fit.left + 1f, fit.top + 1f),
+                        size = Size(fit.width - 2f, fit.height - 2f),
+                        style = borderStroke
+                    )
+                }
+            }
+    )
+}
+
+/**
+ * Fills the image rect with a radial gradient whose radius is the brush's
+ * radius times [radiusScale]: the canvas is scaled about the gradient centre
+ * and the rect is drawn in the matching pre-scaled coordinates.
+ */
+private fun DrawScope.drawAuroraBlob(brush: Brush, center: Offset, radiusScale: Float, fit: FittedImage) {
+    if (radiusScale <= 0f) return
+    scale(radiusScale, pivot = center) {
+        drawRect(
+            brush = brush,
+            topLeft = Offset(
+                center.x + (fit.left - center.x) / radiusScale,
+                center.y + (fit.top - center.y) / radiusScale
+            ),
+            size = Size(fit.width / radiusScale, fit.height / radiusScale)
+        )
+    }
+}
+
+/** OCR hint boxes, selected-token highlights and pins. Re-recorded only when OCR results or the selection change. */
+@Composable
+private fun OcrSelectionLayer(
+    bitmapWidth: Int,
+    bitmapHeight: Int,
+    ocrItems: List<OcrTextItem>,
+    textSelection: TextSelectionState?
+) {
+    if (ocrItems.isEmpty() && (textSelection == null || textSelection.selectedTokens.isEmpty())) return
+    Canvas(modifier = Modifier.fillMaxSize().graphicsLayer {}) {
+        val fit = fitImage(size.width, size.height, bitmapWidth, bitmapHeight)
+        val destLeft = fit.left
+        val destTop = fit.top
+        val scaleX = fit.width / bitmapWidth.toFloat()
+        val scaleY = fit.height / bitmapHeight.toFloat()
+
+        // 1. Draw subtle hint boxes for all recognized OCR lines
+        val hintStroke = Stroke(width = 1f)
+        val hintCorner = CornerRadius(4f, 4f)
+        for (item in ocrItems) {
+            val box = item.boundingBox
+            val left = destLeft + box.left * scaleX
+            val top = destTop + box.top * scaleY
+            val right = destLeft + box.right * scaleX
+            val bottom = destTop + box.bottom * scaleY
+
+            drawRoundRect(
+                color = OcrHintColor,
+                topLeft = Offset(left, top),
+                size = Size(right - left, bottom - top),
+                cornerRadius = hintCorner,
+                style = hintStroke
             )
+        }
 
-            // Dark translucent scrim for authentic Circle to Search aesthetic
-            drawRect(
-                color = Color(0x38000000),
-                topLeft = Offset(destLeft, destTop),
-                size = Size(destWidth, destHeight)
-            )
-
-            // 1. Organic Misty Aurora / Fog Glowing Perimeter ("もやもや" effect from Google Circle to Search)
-            val baseRadius = max(destWidth, destHeight) * 0.55f
-
-            // Top-Left Cyan / Sky Blue Misty Blob
-            val tlRadius = baseRadius * pulsePhase
-            drawRect(
-                brush = Brush.radialGradient(
-                    colors = listOf(
-                        Color(0x8C2563EB),
-                        Color(0x6638BDF8),
-                        Color(0x3360A5FA),
-                        Color(0x1038BDF8),
-                        Color(0x002563EB)
-                    ),
-                    center = Offset(destLeft + destWidth * 0.05f, destTop + destHeight * 0.08f),
-                    radius = tlRadius
-                ),
-                topLeft = Offset(destLeft, destTop),
-                size = Size(destWidth, destHeight)
-            )
-
-            // Right-side & Top-Right Warm Amber / Gold Misty Blob
-            val trRadius = baseRadius * (2.1f - pulsePhase)
-            drawRect(
-                brush = Brush.radialGradient(
-                    colors = listOf(
-                        Color(0x90F59E0B),
-                        Color(0x66EAB308),
-                        Color(0x33F97316),
-                        Color(0x10F59E0B),
-                        Color(0x00F59E0B)
-                    ),
-                    center = Offset(destLeft + destWidth * 0.96f, destTop + destHeight * 0.32f),
-                    radius = trRadius
-                ),
-                topLeft = Offset(destLeft, destTop),
-                size = Size(destWidth, destHeight)
-            )
-
-            // Bottom-Right / Bottom Emerald Green & Teal Misty Blob
-            val brRadius = baseRadius * pulsePhase
-            drawRect(
-                brush = Brush.radialGradient(
-                    colors = listOf(
-                        Color(0x8C10B981),
-                        Color(0x6014B8A6),
-                        Color(0x30059669),
-                        Color(0x1010B981),
-                        Color(0x0010B981)
-                    ),
-                    center = Offset(destLeft + destWidth * 0.88f, destTop + destHeight * 0.90f),
-                    radius = brRadius
-                ),
-                topLeft = Offset(destLeft, destTop),
-                size = Size(destWidth, destHeight)
-            )
-
-            // Bottom-Left Cyan / Teal Misty Blob
-            val blRadius = baseRadius * (2.05f - pulsePhase)
-            drawRect(
-                brush = Brush.radialGradient(
-                    colors = listOf(
-                        Color(0x7506B6D4),
-                        Color(0x4D10B981),
-                        Color(0x2038BDF8),
-                        Color(0x0006B6D4)
-                    ),
-                    center = Offset(destLeft + destWidth * 0.12f, destTop + destHeight * 0.88f),
-                    radius = blRadius
-                ),
-                topLeft = Offset(destLeft, destTop),
-                size = Size(destWidth, destHeight)
-            )
-
-            // Outer border line connecting the aurora colors
-            val borderBrush = Brush.sweepGradient(
-                colors = listOf(
-                    Color(0xFF38BDF8),
-                    Color(0xFFF59E0B),
-                    Color(0xFF10B981),
-                    Color(0xFF06B6D4),
-                    Color(0xFF38BDF8)
-                ),
-                center = Offset(canvasWidth / 2f, canvasHeight / 2f)
-            )
-            drawRect(
-                brush = borderBrush,
-                topLeft = Offset(destLeft + 1f, destTop + 1f),
-                size = Size(destWidth - 2f, destHeight - 2f),
-                style = Stroke(width = 3.5f)
-            )
-
-            val scaleX = destWidth / bmpWidth
-            val scaleY = destHeight / bmpHeight
-
-            // 1. Draw subtle hint boxes for all recognized OCR lines
-            for (item in ocrItems) {
-                val box = item.boundingBox
+        // 2. Draw fine-grained selected tokens & Start/End Pins
+        if (textSelection != null && textSelection.selectedTokens.isNotEmpty()) {
+            val highlightCorner = CornerRadius(6f, 6f)
+            for (token in textSelection.selectedTokens) {
+                val box = token.boundingBox
                 val left = destLeft + box.left * scaleX
                 val top = destTop + box.top * scaleY
                 val right = destLeft + box.right * scaleX
                 val bottom = destTop + box.bottom * scaleY
 
+                // Blue highlight pill
                 drawRoundRect(
-                    color = Color(0x1560A5FA),
-                    topLeft = Offset(left, top),
-                    size = Size(right - left, bottom - top),
-                    cornerRadius = CornerRadius(4f, 4f),
-                    style = Stroke(width = 1f)
+                    brush = SelectionHighlightBrush,
+                    topLeft = Offset(left - 2f, top - 2f),
+                    size = Size(right - left + 4f, bottom - top + 4f),
+                    cornerRadius = highlightCorner
                 )
             }
 
-            // 2. Draw fine-grained selected tokens & Start/End Pins
-            if (textSelection != null && textSelection.selectedTokens.isNotEmpty()) {
-                for (token in textSelection.selectedTokens) {
-                    val box = token.boundingBox
-                    val left = destLeft + box.left * scaleX
-                    val top = destTop + box.top * scaleY
-                    val right = destLeft + box.right * scaleX
-                    val bottom = destTop + box.bottom * scaleY
+            // Draw Start Pin (Droplet handle at top-left of first token)
+            val firstBox = textSelection.selectedTokens.first().boundingBox
+            val startX = destLeft + firstBox.left * scaleX
+            val startY = destTop + firstBox.top * scaleY
+            drawSelectionPin(
+                pinPoint = Offset(startX, startY),
+                isStart = true
+            )
 
-                    // Blue highlight pill
-                    drawRoundRect(
-                        brush = Brush.horizontalGradient(
-                            listOf(Color(0xB81D4ED8), Color(0xCC2563EB))
-                        ),
-                        topLeft = Offset(left - 2f, top - 2f),
-                        size = Size(right - left + 4f, bottom - top + 4f),
-                        cornerRadius = CornerRadius(6f, 6f)
-                    )
-                }
+            // Draw End Pin (Droplet handle at bottom-right of last token)
+            val lastBox = textSelection.selectedTokens.last().boundingBox
+            val endX = destLeft + lastBox.right * scaleX
+            val endY = destTop + lastBox.bottom * scaleY
+            drawSelectionPin(
+                pinPoint = Offset(endX, endY),
+                isStart = false
+            )
+        }
+    }
+}
 
-                // Draw Start Pin (Droplet handle at top-left of first token)
-                val firstBox = textSelection.selectedTokens.first().boundingBox
-                val startX = destLeft + firstBox.left * scaleX
-                val startY = destTop + firstBox.top * scaleY
-                drawSelectionPin(
-                    pinPoint = Offset(startX, startY),
-                    isStart = true
-                )
-
-                // Draw End Pin (Droplet handle at bottom-right of last token)
-                val lastBox = textSelection.selectedTokens.last().boundingBox
-                val endX = destLeft + lastBox.right * scaleX
-                val endY = destTop + lastBox.bottom * scaleY
-                drawSelectionPin(
-                    pinPoint = Offset(endX, endY),
-                    isStart = false
-                )
-            }
-
-            // 3. Draw Crop Selection Frame & Corner L-Brackets
-            if (cropSelection != null) {
+/** Crop frame. Its dashed border is animated, so only this layer redraws per frame while a crop is active. */
+@Composable
+private fun CropLayer(
+    bitmapWidth: Int,
+    bitmapHeight: Int,
+    cropSelection: CropSelection,
+    phase: State<Float>
+) {
+    Spacer(
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer {}
+            .drawWithCache {
+                val fit = fitImage(size.width, size.height, bitmapWidth, bitmapHeight)
                 val crop = cropSelection.rect
-
-                // Ambient vignette outside crop
-                drawRect(
-                    color = Color(0x40000000),
-                    topLeft = Offset(destLeft, destTop),
-                    size = Size(destWidth, destHeight)
+                val borderBrush = Brush.sweepGradient(
+                    colors = CropBorderColors,
+                    center = Offset(crop.centerX(), crop.centerY())
                 )
 
-                // Glowing animated dashed border
-                drawRoundRect(
-                    brush = Brush.sweepGradient(
-                        colors = listOf(
-                            Color(0xFF38BDF8),
-                            Color(0xFF818CF8),
-                            Color(0xFFF472B6),
-                            Color(0xFFFBBF24),
-                            Color(0xFF38BDF8)
-                        ),
-                        center = Offset(crop.centerX(), crop.centerY())
-                    ),
-                    topLeft = Offset(crop.left, crop.top),
-                    size = Size(crop.width(), crop.height()),
-                    cornerRadius = CornerRadius(16f, 16f),
-                    style = Stroke(
-                        width = 3.5f,
-                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(30f, 15f), phase * 45f)
+                onDrawBehind {
+                    // Ambient vignette outside crop
+                    drawRect(
+                        color = CropVignetteColor,
+                        topLeft = Offset(fit.left, fit.top),
+                        size = Size(fit.width, fit.height)
                     )
-                )
 
-                // Draw Authentic Circle-to-Search Corner L-Brackets ⌜ ⌝ ⌞ ⌟
-                val bracketLen = min(crop.width() * 0.25f, 32f).coerceAtLeast(16f)
-                val bracketStroke = 4.5f
-                val bracketColor = Color.White
+                    // Glowing animated dashed border
+                    drawRoundRect(
+                        brush = borderBrush,
+                        topLeft = Offset(crop.left, crop.top),
+                        size = Size(crop.width(), crop.height()),
+                        cornerRadius = CornerRadius(16f, 16f),
+                        style = Stroke(
+                            width = 3.5f,
+                            pathEffect = PathEffect.dashPathEffect(CropDashIntervals, phase.value * 45f)
+                        )
+                    )
 
-                // Top-Left ⌜
-                drawLine(bracketColor, Offset(crop.left - 2f, crop.top + bracketLen), Offset(crop.left - 2f, crop.top - 2f), bracketStroke, StrokeCap.Round)
-                drawLine(bracketColor, Offset(crop.left - 2f, crop.top - 2f), Offset(crop.left + bracketLen, crop.top - 2f), bracketStroke, StrokeCap.Round)
+                    // Draw Authentic Circle-to-Search Corner L-Brackets ⌜ ⌝ ⌞ ⌟
+                    val bracketLen = min(crop.width() * 0.25f, 32f).coerceAtLeast(16f)
+                    val bracketStroke = 4.5f
+                    val bracketColor = Color.White
 
-                // Top-Right ⌝
-                drawLine(bracketColor, Offset(crop.right + 2f, crop.top + bracketLen), Offset(crop.right + 2f, crop.top - 2f), bracketStroke, StrokeCap.Round)
-                drawLine(bracketColor, Offset(crop.right + 2f, crop.top - 2f), Offset(crop.right - bracketLen, crop.top - 2f), bracketStroke, StrokeCap.Round)
+                    // Top-Left ⌜
+                    drawLine(bracketColor, Offset(crop.left - 2f, crop.top + bracketLen), Offset(crop.left - 2f, crop.top - 2f), bracketStroke, StrokeCap.Round)
+                    drawLine(bracketColor, Offset(crop.left - 2f, crop.top - 2f), Offset(crop.left + bracketLen, crop.top - 2f), bracketStroke, StrokeCap.Round)
 
-                // Bottom-Left ⌞
-                drawLine(bracketColor, Offset(crop.left - 2f, crop.bottom - bracketLen), Offset(crop.left - 2f, crop.bottom + 2f), bracketStroke, StrokeCap.Round)
-                drawLine(bracketColor, Offset(crop.left - 2f, crop.bottom + 2f), Offset(crop.left + bracketLen, crop.bottom + 2f), bracketStroke, StrokeCap.Round)
+                    // Top-Right ⌝
+                    drawLine(bracketColor, Offset(crop.right + 2f, crop.top + bracketLen), Offset(crop.right + 2f, crop.top - 2f), bracketStroke, StrokeCap.Round)
+                    drawLine(bracketColor, Offset(crop.right + 2f, crop.top - 2f), Offset(crop.right - bracketLen, crop.top - 2f), bracketStroke, StrokeCap.Round)
 
-                // Bottom-Right ⌟
-                drawLine(bracketColor, Offset(crop.right + 2f, crop.bottom - bracketLen), Offset(crop.right + 2f, crop.bottom + 2f), bracketStroke, StrokeCap.Round)
-                drawLine(bracketColor, Offset(crop.right + 2f, crop.bottom + 2f), Offset(crop.right - bracketLen, crop.bottom + 2f), bracketStroke, StrokeCap.Round)
+                    // Bottom-Left ⌞
+                    drawLine(bracketColor, Offset(crop.left - 2f, crop.bottom - bracketLen), Offset(crop.left - 2f, crop.bottom + 2f), bracketStroke, StrokeCap.Round)
+                    drawLine(bracketColor, Offset(crop.left - 2f, crop.bottom + 2f), Offset(crop.left + bracketLen, crop.bottom + 2f), bracketStroke, StrokeCap.Round)
 
-                // Corner pill handles
-                val corners = listOf(
-                    Offset(crop.left, crop.top),
-                    Offset(crop.right, crop.top),
-                    Offset(crop.left, crop.bottom),
-                    Offset(crop.right, crop.bottom)
-                )
-                for (corner in corners) {
-                    drawCircle(color = Color(0xFF1E293B), radius = 10f, center = corner)
-                    drawCircle(color = Color(0xFF38BDF8), radius = 7f, center = corner)
+                    // Bottom-Right ⌟
+                    drawLine(bracketColor, Offset(crop.right + 2f, crop.bottom - bracketLen), Offset(crop.right + 2f, crop.bottom + 2f), bracketStroke, StrokeCap.Round)
+                    drawLine(bracketColor, Offset(crop.right + 2f, crop.bottom + 2f), Offset(crop.right - bracketLen, crop.bottom + 2f), bracketStroke, StrokeCap.Round)
+
+                    // Corner pill handles
+                    drawCropCornerHandle(Offset(crop.left, crop.top))
+                    drawCropCornerHandle(Offset(crop.right, crop.top))
+                    drawCropCornerHandle(Offset(crop.left, crop.bottom))
+                    drawCropCornerHandle(Offset(crop.right, crop.bottom))
+
+                    // Midpoint edge drag pills
+                    val midTop = Offset(crop.centerX(), crop.top)
+                    val midBottom = Offset(crop.centerX(), crop.bottom)
+                    val midLeft = Offset(crop.left, crop.centerY())
+                    val midRight = Offset(crop.right, crop.centerY())
+
+                    drawRoundRect(Color.White, Offset(midTop.x - 14f, midTop.y - 3.5f), Size(28f, 7f), CornerRadius(4f, 4f))
+                    drawRoundRect(Color.White, Offset(midBottom.x - 14f, midBottom.y - 3.5f), Size(28f, 7f), CornerRadius(4f, 4f))
+                    drawRoundRect(Color.White, Offset(midLeft.x - 3.5f, midLeft.y - 14f), Size(7f, 28f), CornerRadius(4f, 4f))
+                    drawRoundRect(Color.White, Offset(midRight.x - 3.5f, midRight.y - 14f), Size(7f, 28f), CornerRadius(4f, 4f))
                 }
+            }
+    )
+}
 
-                // Midpoint edge drag pills
-                val midTop = Offset(crop.centerX(), crop.top)
-                val midBottom = Offset(crop.centerX(), crop.bottom)
-                val midLeft = Offset(crop.left, crop.centerY())
-                val midRight = Offset(crop.right, crop.centerY())
+private fun DrawScope.drawCropCornerHandle(corner: Offset) {
+    drawCircle(color = Color(0xFF1E293B), radius = 10f, center = corner)
+    drawCircle(color = Color(0xFF38BDF8), radius = 7f, center = corner)
+}
 
-                drawRoundRect(Color.White, Offset(midTop.x - 14f, midTop.y - 3.5f), Size(28f, 7f), CornerRadius(4f, 4f))
-                drawRoundRect(Color.White, Offset(midBottom.x - 14f, midBottom.y - 3.5f), Size(28f, 7f), CornerRadius(4f, 4f))
-                drawRoundRect(Color.White, Offset(midLeft.x - 3.5f, midLeft.y - 14f), Size(7f, 28f), CornerRadius(4f, 4f))
-                drawRoundRect(Color.White, Offset(midRight.x - 3.5f, midRight.y - 14f), Size(7f, 28f), CornerRadius(4f, 4f))
+/** User gesture stroke (neon laser ribbon) and particle trail. The only layer re-recorded per stroke point. */
+@Composable
+private fun StrokeLayer(activeStrokePoints: List<Offset>, trailPoints: List<TrailPoint>) {
+    Canvas(modifier = Modifier.fillMaxSize().graphicsLayer {}) {
+        // 4. Draw User Gesture Stroke (Neon Laser Ribbon)
+        if (activeStrokePoints.size > 1) {
+            val strokePath = Path()
+            strokePath.moveTo(activeStrokePoints.first().x, activeStrokePoints.first().y)
+            for (i in 1 until activeStrokePoints.size) {
+                val p = activeStrokePoints[i]
+                strokePath.lineTo(p.x, p.y)
             }
 
-            // 4. Draw User Gesture Stroke (Neon Laser Ribbon)
-            if (activeStrokePoints.size > 1) {
-                val strokePath = Path()
-                strokePath.moveTo(activeStrokePoints.first().x, activeStrokePoints.first().y)
-                for (i in 1 until activeStrokePoints.size) {
-                    val p = activeStrokePoints[i]
-                    strokePath.lineTo(p.x, p.y)
-                }
+            // Neon aura
+            drawPath(
+                path = strokePath,
+                brush = StrokeAuraBrush,
+                style = Stroke(width = 16f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            )
+            // White core
+            drawPath(
+                path = strokePath,
+                color = Color.White,
+                style = Stroke(width = 5f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            )
+        }
 
-                // Neon aura
-                drawPath(
-                    path = strokePath,
-                    brush = Brush.horizontalGradient(
-                        listOf(Color(0x9938BDF8), Color(0xCC818CF8), Color(0x99F472B6))
-                    ),
-                    style = Stroke(width = 16f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-                )
-                // White core
-                drawPath(
-                    path = strokePath,
-                    color = Color.White,
-                    style = Stroke(width = 5f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-                )
-            }
-
-            // 5. Draw Particle Trails
-            for ((index, trail) in trailPoints.withIndex()) {
-                val age = (trailPoints.size - index).toFloat() / trailPoints.size
-                val radius = (1f - age) * 10f + 2f
-                val alpha = (1f - age) * 0.9f
-                drawCircle(
-                    color = Color(0xFF67E8F9).copy(alpha = alpha),
-                    radius = radius,
-                    center = trail.position
-                )
-            }
+        // 5. Draw Particle Trails
+        for ((index, trail) in trailPoints.withIndex()) {
+            val age = (trailPoints.size - index).toFloat() / trailPoints.size
+            val radius = (1f - age) * 10f + 2f
+            val alpha = (1f - age) * 0.9f
+            drawCircle(
+                color = TrailColor.copy(alpha = alpha),
+                radius = radius,
+                center = trail.position
+            )
         }
     }
 }
@@ -652,5 +747,29 @@ private fun DrawScope.drawSelectionPin(pinPoint: Offset, isStart: Boolean) {
         drawCircle(color = Color.White, radius = pinRadius + 2.5f, center = center)
         drawCircle(color = pinColor, radius = pinRadius, center = center)
         drawCircle(color = Color.White, radius = 5f, center = center)
+    }
+}
+
+/** Drives the aurora phase/pulse animatables while interaction is active. */
+private suspend fun launchPhases(phaseAnim: Animatable<Float, *>, pulseAnim: Animatable<Float, *>) {
+    kotlinx.coroutines.coroutineScope {
+        launch {
+            phaseAnim.animateTo(
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(2000, easing = LinearEasing),
+                    repeatMode = RepeatMode.Restart
+                )
+            )
+        }
+        launch {
+            pulseAnim.animateTo(
+                targetValue = 1.12f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(2200, easing = FastOutSlowInEasing),
+                    repeatMode = RepeatMode.Reverse
+                )
+            )
+        }
     }
 }

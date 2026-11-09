@@ -1,26 +1,56 @@
-import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
-
 plugins {
   alias(libs.plugins.android.application)
   alias(libs.plugins.kotlin.compose)
-  alias(libs.plugins.google.devtools.ksp)
   alias(libs.plugins.roborazzi)
-  alias(libs.plugins.secrets)
-  alias(libs.plugins.google.services)
 }
+
+val llamaCppDir: File? = (System.getenv("LLAMA_CPP_DIR")?.let { file(it) } ?: file("../../../llama.cpp"))
+  .takeIf { it.exists() }
 
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
+  ndkVersion = "27.0.12077973"
 
   defaultConfig {
     applicationId = "com.aistudio.circleocr.qkrvwz"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = 11
+    versionName = "1.1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+    ndk {
+      abiFilters += listOf("arm64-v8a")
+    }
+    // PLaMo translation native engine (llama.cpp). LLAMA_CPP_DIR (used by CI)
+    // wins; otherwise the local workspace layout (../../../llama.cpp) is used.
+    llamaCppDir?.let { llamaDir ->
+      externalNativeBuild {
+        cmake {
+          arguments += "-DLLAMA_CPP_DIR=${llamaDir.absolutePath}"
+          // KleidiAI sources: local copy when present, otherwise CMake's
+          // FetchContent downloads them (CI).
+          val kleidiDir = file("../../../.tools/kleidiai-src/kleidiai-v1.32.0")
+          if (kleidiDir.exists()) {
+            arguments += "-DFETCHCONTENT_SOURCE_DIR_KLEIDIAI=${kleidiDir.absolutePath}"
+          }
+          arguments += "-DCMAKE_BUILD_TYPE=Release"
+        }
+      }
+    }
+  }
+
+  // Without a llama.cpp checkout the APK builds without libplamo_llama.so and
+  // translation reports that the library could not be loaded.
+  if (llamaCppDir != null) {
+    externalNativeBuild {
+      cmake {
+        path = file("src/main/cpp/CMakeLists.txt")
+        version = "3.22.1"
+      }
+    }
   }
 
   signingConfigs {
@@ -42,7 +72,11 @@ android {
   buildTypes {
     release {
       isCrunchPngs = false
-      isMinifyEnabled = false
+      // R8 enabled for release: keep rules in proguard-rules.pro cover the
+      // JNI bridge (com.koike.llama) and ML Kit entry points. The shipped
+      // debug build is unaffected; R8 output is verified via
+      // :app:minifyReleaseWithR8 before this stays on.
+      isMinifyEnabled = true
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       signingConfig = signingConfigs.getByName("release")
     }
@@ -63,21 +97,10 @@ android {
   }
 }
 
-// Configure the Secrets Gradle Plugin to use .env and .env.example files
-// to match the convention used in Web projects.
-secrets {
-  propertiesFileName = ".env"
-  defaultPropertiesFileName = ".env.example"
-  ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
-}
-
-googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
-
 // Some unused dependencies are commented out below instead of being removed.
 // This makes it easy to add them back in the future if needed.
 dependencies {
   implementation(platform(libs.androidx.compose.bom))
-  implementation(platform(libs.firebase.bom))
   // implementation(libs.accompanist.permissions)
   implementation(libs.androidx.activity.compose)
   // implementation(libs.androidx.camera.camera2)
@@ -91,18 +114,12 @@ dependencies {
   implementation(libs.androidx.compose.ui.graphics)
   implementation(libs.androidx.compose.ui.tooling.preview)
   implementation(libs.androidx.core.ktx)
-  implementation(libs.androidx.datastore.preferences)
   implementation(libs.androidx.lifecycle.runtime.compose)
   implementation(libs.androidx.lifecycle.runtime.ktx)
   implementation(libs.androidx.lifecycle.viewmodel.compose)
   // implementation(libs.androidx.navigation.compose)
-  implementation(libs.androidx.room.ktx)
-  implementation(libs.androidx.room.runtime)
-  implementation(libs.coil.compose)
   implementation(libs.mlkit.text.recognition)
   implementation(libs.mlkit.text.recognition.japanese)
-  implementation(libs.converter.moshi)
-  implementation(libs.firebase.ai)
   // Uncomment to use Firestore:
   // implementation(libs.firebase.firestore)
 
@@ -112,14 +129,9 @@ dependencies {
   // implementation(libs.androidx.credentials)
   // implementation(libs.androidx.credentials.play.services)
   // implementation(libs.googleid)
-  implementation(libs.firebase.appcheck.recaptcha)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
-  implementation(libs.logging.interceptor)
-  implementation(libs.moshi.kotlin)
-  implementation(libs.okhttp)
   // implementation(libs.play.services.location)
-  implementation(libs.retrofit)
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)
@@ -136,6 +148,4 @@ dependencies {
   androidTestImplementation(libs.androidx.runner)
   debugImplementation(libs.androidx.compose.ui.test.manifest)
   debugImplementation(libs.androidx.compose.ui.tooling)
-  "ksp"(libs.androidx.room.compiler)
-  "ksp"(libs.moshi.kotlin.codegen)
 }

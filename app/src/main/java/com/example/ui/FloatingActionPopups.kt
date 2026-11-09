@@ -21,8 +21,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.TextFields
+import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Surface
@@ -57,7 +60,8 @@ fun TextSelectionPopup(
     onCopy: () -> Unit,
     onShareGeneral: () -> Unit,
     onShareDirect: (ShareTarget) -> Unit,
-    onOpenAllTargetsPicker: () -> Unit = {}
+    onOpenShareSheet: () -> Unit = {},
+    onTranslate: () -> Unit = {}
 ) {
     var showRecentSlider by remember { mutableStateOf(false) }
 
@@ -81,9 +85,9 @@ fun TextSelectionPopup(
                     showRecentSlider = false
                     onShareDirect(target)
                 },
-                onOpenAllTargetsPicker = {
+                onOpenShareSheet = {
                     showRecentSlider = false
-                    onOpenAllTargetsPicker()
+                    onOpenShareSheet()
                 },
                 onDismiss = {
                     showRecentSlider = false
@@ -136,6 +140,23 @@ fun TextSelectionPopup(
                         Icon(
                             imageVector = Icons.Default.Share,
                             contentDescription = "テキストを共有",
+                            tint = Color(0xFF0F172A),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    // Translate Button (on-device PLaMo translation bar)
+                    IconButton(
+                        onClick = onTranslate,
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(CircleShape)
+                            .background(Color(0x0F000000))
+                            .testTag("translate_text_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Translate,
+                            contentDescription = "翻訳",
                             tint = Color(0xFF0F172A),
                             modifier = Modifier.size(20.dp)
                         )
@@ -206,7 +227,8 @@ fun TextSelectionPopup(
 
 /**
  * Clean & minimal floating crop action toolbar styled with white frosted glass and monochrome black accents.
- * Displays only "画像をシェア" and the adjacent direct share app icon.
+ * Displays "枠内テキストを抽出" (re-OCR), "画像をシェア", "画像を保存" (straight to the
+ * Download folder, no app switch) and the adjacent direct share app icon.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -217,7 +239,9 @@ fun CropSelectionPopup(
     recentTargets: List<ShareTarget> = emptyList(),
     onShareImageGeneral: () -> Unit,
     onShareImageDirect: (ShareTarget) -> Unit,
-    onOpenAllTargetsPicker: () -> Unit = {}
+    onOpenShareSheet: () -> Unit = {},
+    onOcrCrop: () -> Unit = {},
+    onSaveImage: () -> Unit = {}
 ) {
     var showRecentSlider by remember { mutableStateOf(false) }
 
@@ -241,9 +265,9 @@ fun CropSelectionPopup(
                     showRecentSlider = false
                     onShareImageDirect(target)
                 },
-                onOpenAllTargetsPicker = {
+                onOpenShareSheet = {
                     showRecentSlider = false
-                    onOpenAllTargetsPicker()
+                    onOpenShareSheet()
                 },
                 onDismiss = {
                     showRecentSlider = false
@@ -267,6 +291,23 @@ fun CropSelectionPopup(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
+                    // Re-OCR inside the frame (text extraction)
+                    IconButton(
+                        onClick = onOcrCrop,
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(CircleShape)
+                            .background(Color(0x0F000000))
+                            .testTag("ocr_crop_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.TextFields,
+                            contentDescription = "枠内テキストを抽出",
+                            tint = Color(0xFF0F172A),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
                     // Share Image (General)
                     IconButton(
                         onClick = onShareImageGeneral,
@@ -279,6 +320,23 @@ fun CropSelectionPopup(
                         Icon(
                             imageVector = Icons.Default.Image,
                             contentDescription = "画像を共有",
+                            tint = Color(0xFF0F172A),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    // Save to the Download folder without leaving the app
+                    IconButton(
+                        onClick = onSaveImage,
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(CircleShape)
+                            .background(Color(0x0F000000))
+                            .testTag("save_crop_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Download,
+                            contentDescription = "画像をダウンロードに保存",
                             tint = Color(0xFF0F172A),
                             modifier = Modifier.size(20.dp)
                         )

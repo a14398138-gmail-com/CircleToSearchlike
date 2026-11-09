@@ -4,34 +4,47 @@ import android.app.PendingIntent
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
 import android.widget.Toast
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.content.FileProvider
 import com.example.model.ShareTarget
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 
 class ShareManager private constructor(context: Context) {
 
     private val appContext = context.applicationContext
-    private val prefs = appContext.getSharedPreferences("circle_ocr_share_prefs", Context.MODE_PRIVATE)
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private val _lastTextShareTarget = MutableStateFlow<ShareTarget?>(null)
     val lastTextShareTarget: StateFlow<ShareTarget?> = _lastTextShareTarget.asStateFlow()
@@ -45,11 +58,111 @@ class ShareManager private constructor(context: Context) {
     private val _recentImageShareTargets = MutableStateFlow<List<ShareTarget>>(emptyList())
     val recentImageShareTargets: StateFlow<List<ShareTarget>> = _recentImageShareTargets.asStateFlow()
 
-    init {
-        loadPersistedTargets()
+    /** Serialized writer for the first-frame snapshot (see [quickSnapshot]). */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val snapshotScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+
+    private val availableTargetsCache =
+        java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<ShareTarget>>>()
+
+    /** Icons are shown at <= 36dp; rendering adaptive icons at their 108dp intrinsic size wasted memory and time. */
+    private val maxIconSizePx: Int =
+        (ICON_MAX_SIZE_DP * appContext.resources.displayMetrics.density).toInt().coerceAtLeast(48)
+
+    // Loading persisted targets queries PackageManager (labels and icons), far
+    // too heavy for the main thread, so construction is cheap and [initialize]
+    // runs the load once on an IO dispatcher.
+    @Volatile
+    private var initialized = false
+    private val initMutex = kotlinx.coroutines.sync.Mutex()
+
+    suspend fun initialize() = withContext(Dispatchers.IO) {
+        if (initialized) return@withContext
+        initMutex.withLock {
+            if (initialized) return@withLock
+            loadPersistedTargets()
+            initialized = true
+        }
     }
 
+    /**
+     * Share targets already queried by [getAvailableShareTargets] (never
+     * triggers the query itself; empty until something needed the full list).
+     */
+    fun cachedAvailableTargets(isImage: Boolean): List<ShareTarget> =
+        availableTargetsCache[if (isImage) "image/*" else "text/plain"]?.second.orEmpty()
+
+    /** Share targets known without touching PackageManager, for the first frame. */
+    data class QuickSnapshot(
+        val lastTextTarget: ShareTarget?,
+        val lastImageTarget: ShareTarget?,
+        val recentTextTargets: List<ShareTarget>,
+        val recentImageTargets: List<ShareTarget>
+    )
+
     companion object {
+        private const val AVAILABLE_TARGETS_TTL_MS = 5 * 60 * 1000L
+        private const val ICON_MAX_SIZE_DP = 48
+        private const val PREFS_NAME = "circle_ocr_share_prefs"
+
+        // First-frame snapshot of the last text/image targets: the component
+        // (same "pkg;activity" encoding as the history), the label, and the
+        // already downscaled icon as a small PNG in filesDir.
+        private const val SNAPSHOT_ICON_DIR = "share_target_icons"
+        private const val SNAPSHOT_TEXT_KEY = "snapshot_text_target"
+        private const val SNAPSHOT_TEXT_LABEL = "snapshot_text_label"
+        private const val SNAPSHOT_IMAGE_KEY = "snapshot_image_target"
+        private const val SNAPSHOT_IMAGE_LABEL = "snapshot_image_label"
+
+        private fun encodeComponent(target: ShareTarget): String =
+            "${target.packageName};${target.activityName ?: ""}"
+
+        private fun iconFileName(component: String): String =
+            component.replace(Regex("[^A-Za-z0-9._-]"), "_") + ".png"
+
+        /**
+         * The last text/image share targets, available synchronously and cheaply
+         * enough for the first frame: the live values once ShareManager has
+         * been initialized in this process, otherwise the snapshot saved on disk (two small
+         * PNG decodes). Loading them through PackageManager takes long enough
+         * that the share button used to appear a beat after the screen.
+         */
+        fun quickSnapshot(context: Context): QuickSnapshot {
+            instance?.takeIf { it.initialized }?.let { sm ->
+                return QuickSnapshot(
+                    sm._lastTextShareTarget.value,
+                    sm._lastImageShareTarget.value,
+                    sm._recentTextShareTargets.value,
+                    sm._recentImageShareTargets.value
+                )
+            }
+            return try {
+                val appContext = context.applicationContext
+                val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val dir = File(appContext.filesDir, SNAPSHOT_ICON_DIR)
+                fun read(keyPref: String, labelPref: String): ShareTarget? {
+                    val component = prefs.getString(keyPref, null) ?: return null
+                    val parts = component.split(";")
+                    val pkg = parts[0].takeIf { it.isNotBlank() } ?: return null
+                    val activity = parts.getOrNull(1)?.takeIf { it.isNotBlank() }
+                    val iconFile = File(dir, iconFileName(component))
+                    val icon = if (iconFile.exists()) BitmapFactory.decodeFile(iconFile.path) else null
+                    return ShareTarget(
+                        packageName = pkg,
+                        activityName = activity,
+                        appName = prefs.getString(labelPref, null) ?: pkg,
+                        iconBitmap = icon?.asImageBitmap()
+                    )
+                }
+                val text = read(SNAPSHOT_TEXT_KEY, SNAPSHOT_TEXT_LABEL)
+                val image = read(SNAPSHOT_IMAGE_KEY, SNAPSHOT_IMAGE_LABEL)
+                QuickSnapshot(text, image, listOfNotNull(text), listOfNotNull(image))
+            } catch (e: Throwable) {
+                Log.w("ShareManager", "Could not read share target snapshot", e)
+                QuickSnapshot(null, null, emptyList(), emptyList())
+            }
+        }
+
         @Volatile
         private var instance: ShareManager? = null
 
@@ -61,8 +174,12 @@ class ShareManager private constructor(context: Context) {
     }
 
     private fun loadPersistedTargets() {
-        val availableText = getAvailableShareTargets("text/plain")
-        val availableImg = getAvailableShareTargets("image/*")
+        // The full share-target query (queryIntentActivities + label + icon for
+        // every installed share target) is only needed as a fallback when no
+        // history exists yet. It used to run unconditionally, twice, on every
+        // process start, which dominated cold-start time.
+        val availableText by lazy { getAvailableShareTargets("text/plain") }
+        val availableImg by lazy { getAvailableShareTargets("image/*") }
 
         // Load Text History
         val textHistoryRaw = prefs.getString("recent_text_history", null)
@@ -85,7 +202,7 @@ class ShareManager private constructor(context: Context) {
             textTargets.addAll(availableText.take(5))
         }
         _recentTextShareTargets.value = textTargets
-        _lastTextShareTarget.value = textTargets.firstOrNull() ?: availableText.firstOrNull()
+        _lastTextShareTarget.value = textTargets.firstOrNull()
 
         // Load Image History
         val imgHistoryRaw = prefs.getString("recent_img_history", null)
@@ -108,10 +225,30 @@ class ShareManager private constructor(context: Context) {
             imgTargets.addAll(availableImg.take(5))
         }
         _recentImageShareTargets.value = imgTargets
-        _lastImageShareTarget.value = imgTargets.firstOrNull() ?: availableImg.firstOrNull()
+        _lastImageShareTarget.value = imgTargets.firstOrNull()
+
+        persistSnapshot()
     }
 
-    fun getAvailableShareTargets(mimeType: String): List<ShareTarget> {
+    /**
+     * Returns every activity that accepts ACTION_SEND for [mimeType].
+     * Results are cached per MIME type for [AVAILABLE_TARGETS_TTL_MS]: the
+     * query loads a label and an icon for every share target on the device,
+     * and it is needed by several call sites (fallback history, history
+     * entries that no longer resolve, the target picker).
+     */
+    fun getAvailableShareTargets(mimeType: String, forceRefresh: Boolean = false): List<ShareTarget> {
+        if (!forceRefresh) {
+            availableTargetsCache[mimeType]?.let { (loadedAt, targets) ->
+                if (System.currentTimeMillis() - loadedAt < AVAILABLE_TARGETS_TTL_MS) return targets
+            }
+        }
+        val targets = queryAvailableShareTargets(mimeType)
+        availableTargetsCache[mimeType] = System.currentTimeMillis() to targets
+        return targets
+    }
+
+    private fun queryAvailableShareTargets(mimeType: String): List<ShareTarget> {
         val pm = appContext.packageManager
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = mimeType
@@ -128,8 +265,11 @@ class ShareManager private constructor(context: Context) {
         }
 
         val myPkg = appContext.packageName
+        val seen = HashSet<String>()
         return resolveInfos
             .filter { it.activityInfo.packageName != myPkg }
+            // De-duplicate before loading labels/icons instead of after.
+            .filter { seen.add("${it.activityInfo.packageName}/${it.activityInfo.name}") }
             .map { ri ->
                 val pkgName = ri.activityInfo.packageName
                 val actName = ri.activityInfo.name
@@ -144,7 +284,6 @@ class ShareManager private constructor(context: Context) {
                     iconBitmap = iconBmp?.asImageBitmap()
                 )
             }
-            .distinctBy { "${it.packageName}/${it.activityName}" }
     }
 
     private fun resolveTarget(packageName: String, activityName: String?, mimeType: String): ShareTarget? {
@@ -197,6 +336,7 @@ class ShareManager private constructor(context: Context) {
                 .putString("last_img_act", target.activityName)
                 .putString("recent_img_history", serialized)
                 .apply()
+            persistSnapshot()
         } else {
             _lastTextShareTarget.value = target
             val currentList = _recentTextShareTargets.value.toMutableList()
@@ -211,6 +351,46 @@ class ShareManager private constructor(context: Context) {
                 .putString("last_text_act", target.activityName)
                 .putString("recent_text_history", serialized)
                 .apply()
+            persistSnapshot()
+        }
+    }
+
+    /**
+     * Saves the current last text/image targets for [quickSnapshot]. Icons are
+     * rewritten each time (at most twice per process start plus once per
+     * share), so an updated app icon is picked up; files of targets that are
+     * no longer shown are deleted.
+     */
+    private fun persistSnapshot() {
+        val text = _lastTextShareTarget.value
+        val image = _lastImageShareTarget.value
+        snapshotScope.launch {
+            try {
+                val dir = File(appContext.filesDir, SNAPSHOT_ICON_DIR).apply { mkdirs() }
+                val keep = HashSet<String>()
+                val editor = prefs.edit()
+                for ((target, keyPref, labelPref) in listOf(
+                    Triple(text, SNAPSHOT_TEXT_KEY, SNAPSHOT_TEXT_LABEL),
+                    Triple(image, SNAPSHOT_IMAGE_KEY, SNAPSHOT_IMAGE_LABEL)
+                )) {
+                    if (target == null) {
+                        editor.remove(keyPref).remove(labelPref)
+                        continue
+                    }
+                    val component = encodeComponent(target)
+                    editor.putString(keyPref, component).putString(labelPref, target.appName)
+                    val fileName = iconFileName(component)
+                    keep += fileName
+                    val icon = target.iconBitmap?.asAndroidBitmap() ?: continue
+                    val tmp = File(dir, "$fileName.tmp")
+                    FileOutputStream(tmp).use { out -> icon.compress(Bitmap.CompressFormat.PNG, 100, out) }
+                    if (!tmp.renameTo(File(dir, fileName))) tmp.delete()
+                }
+                editor.apply()
+                dir.listFiles()?.forEach { file -> if (file.name !in keep) file.delete() }
+            } catch (e: Throwable) {
+                Log.w("ShareManager", "Could not save share target snapshot", e)
+            }
         }
     }
 
@@ -340,6 +520,83 @@ class ShareManager private constructor(context: Context) {
         true
     }
 
+    /**
+     * Saves [bitmap] as a PNG in the device's Download folder without leaving
+     * the app (the share sheet route through e.g. Files by Google always opens
+     * that app's own screen). Shows a toast and returns whether it was saved.
+     *
+     * Android 10+ writes through MediaStore and needs no permission; on
+     * Android 7-9 the caller must hold WRITE_EXTERNAL_STORAGE.
+     */
+    suspend fun saveImageToDownloads(bitmap: Bitmap): Boolean = withContext(Dispatchers.IO) {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val fileName = "CircleOCR_$stamp.png"
+        val saved = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                saveToDownloadsMediaStore(bitmap, fileName)
+            } else {
+                saveToDownloadsLegacy(bitmap, fileName)
+            }
+        } catch (e: Throwable) {
+            Log.e("ShareManager", "Failed to save image to Downloads", e)
+            false
+        }
+        withContext(Dispatchers.Main) {
+            Toast.makeText(
+                appContext,
+                if (saved) "ダウンロードに保存しました" else "画像を保存できませんでした",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+        saved
+    }
+
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.Q)
+    private fun saveToDownloadsMediaStore(bitmap: Bitmap, fileName: String): Boolean {
+        val resolver = appContext.contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/png")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            // Hidden from other apps until the PNG is completely written.
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return false
+        try {
+            val written = resolver.openOutputStream(uri)?.use { out ->
+                java.io.BufferedOutputStream(out, 32768).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            } ?: false
+            if (!written) {
+                resolver.delete(uri, null, null)
+                return false
+            }
+            resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            return true
+        } catch (e: Throwable) {
+            resolver.delete(uri, null, null)
+            throw e
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun saveToDownloadsLegacy(bitmap: Bitmap, fileName: String): Boolean {
+        val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        if (!dir.exists() && !dir.mkdirs()) return false
+        var file = File(dir, fileName)
+        var n = 1
+        while (file.exists()) file = File(dir, fileName.removeSuffix(".png") + " ($n).png").also { n++ }
+        val written = java.io.BufferedOutputStream(FileOutputStream(file), 32768).use { out ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+        }
+        if (!written) {
+            file.delete()
+            return false
+        }
+        // Make it show up in Files / Photos right away.
+        MediaScannerConnection.scanFile(appContext, arrayOf(file.absolutePath), arrayOf("image/png"), null)
+        return true
+    }
+
     private fun saveBitmapToCache(bitmap: Bitmap, filename: String, subDir: String): Uri? {
         return try {
             val dir = File(appContext.cacheDir, subDir)
@@ -387,8 +644,14 @@ class ShareManager private constructor(context: Context) {
             if (drawable is BitmapDrawable && drawable.bitmap != null) {
                 return drawable.bitmap
             }
-            val width = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 96
-            val height = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 96
+            var width = if (drawable.intrinsicWidth > 0) drawable.intrinsicWidth else 96
+            var height = if (drawable.intrinsicHeight > 0) drawable.intrinsicHeight else 96
+            val largest = maxOf(width, height)
+            if (largest > maxIconSizePx) {
+                val ratio = maxIconSizePx.toFloat() / largest
+                width = (width * ratio).toInt().coerceAtLeast(1)
+                height = (height * ratio).toInt().coerceAtLeast(1)
+            }
             val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(bitmap)
             drawable.setBounds(0, 0, canvas.width, canvas.height)

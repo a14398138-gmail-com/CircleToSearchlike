@@ -57,7 +57,7 @@ fun RecentShareTargetsSlider(
     recentTargets: List<ShareTarget>,
     isImage: Boolean,
     onTargetSelected: (ShareTarget) -> Unit,
-    onOpenAllTargetsPicker: () -> Unit,
+    onOpenShareSheet: () -> Unit,
     onDismiss: () -> Unit
 ) {
     AnimatedVisibility(
@@ -251,13 +251,15 @@ fun RecentShareTargetsSlider(
 
                 Spacer(modifier = Modifier.height(6.dp))
 
-                // "More apps..." Button
+                // "More apps..." Button: opens the system share sheet for the current content.
+                // (It previously opened a custom target picker that was never rendered,
+                // so pressing it did nothing.)
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
                         .clickable {
-                            onOpenAllTargetsPicker()
+                            onOpenShareSheet()
                             onDismiss()
                         },
                     shape = RoundedCornerShape(12.dp),

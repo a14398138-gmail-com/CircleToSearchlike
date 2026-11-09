@@ -50,7 +50,12 @@ data class TextSelectionState(
 data class CropSelection(
     val rect: RectF, // In display coordinate space
     val isConfirmed: Boolean = true,
-    val croppedBitmap: Bitmap? = null
+    val croppedBitmap: Bitmap? = null,
+    /**
+     * Display rect of the screenshot when [rect] was set. The cropped pixels are
+     * cut out lazily from it at share/copy time instead of on every drag event.
+     */
+    val imageRect: RectF? = null
 )
 
 /**

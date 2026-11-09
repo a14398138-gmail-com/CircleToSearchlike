@@ -12,8 +12,6 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -36,46 +34,89 @@ class OcrManager {
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     }
 
+    companion object {
+        /**
+         * Height of one inference tile in original-image pixels.
+         * Tiles are cut from the *unscaled* bitmap: recognition always runs at
+         * native resolution so small on-screen text keeps enough pixels
+         * (ML Kit guidance: at least ~16x16 px per character, ~24x24 for CJK).
+         */
+        private const val TILE_HEIGHT_PX = 1200
+
+        /** Vertical overlap between neighbouring tiles so lines on a seam are seen whole by at least one tile. */
+        private const val TILE_OVERLAP_PX = 200
+
+        /**
+         * Per-tile timeout. A tile that times out simply contributes nothing;
+         * it no longer discards the whole Japanese result or triggers a Latin
+         * fallback (the Latin recognizer cannot read Japanese at all).
+         */
+        private const val TILE_TIMEOUT_MS = 10_000L
+
+        private val WHITESPACE = Regex("\\s+")
+    }
+
+    @Volatile
+    private var latinWarmUpStarted = false
+
     /**
-     * Pre-warms both ML Kit OCR engines by processing a tiny dummy image in background.
-     * This loads the neural network weights, TFLite delegates, and native libraries into memory
-     * so that the user's first actual screen OCR executes with zero cold-start delay.
+     * Pre-warms the primary (Japanese) ML Kit engine by processing a tiny dummy
+     * image, so the model weights, TFLite delegates and native libraries are
+     * loaded before the user's first real screen OCR. The Task is awaited.
+     *
+     * The Latin engine is only used when the Japanese pass finds nothing, so it
+     * is no longer loaded at the same time: doing that competed for CPU and I/O
+     * with the Japanese model load and the first real recognition on cold
+     * start. It is warmed up right after the first real recognition instead
+     * (see [warmUpLatinInBackground]).
      */
     suspend fun warmUp() = withContext(Dispatchers.Default) {
+        val dummyBmp = Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888)
         try {
-            val dummyBmp = Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888)
             val dummyImage = InputImage.fromBitmap(dummyBmp, 0)
-            coroutineScope {
-                async {
-                    try {
-                        japaneseRecognizer.process(dummyImage)
-                    } catch (e: Throwable) {
-                        Log.w("OcrManager", "Japanese warm-up warning", e)
-                    }
-                }
-                async {
-                    try {
-                        latinRecognizer.process(dummyImage)
-                    } catch (e: Throwable) {
-                        Log.w("OcrManager", "Latin warm-up warning", e)
-                    }
-                }
-            }
+            com.google.android.gms.tasks.Tasks.await(japaneseRecognizer.process(dummyImage))
             Log.d("OcrManager", "OCR engine pre-warmed successfully")
         } catch (e: Throwable) {
             Log.w("OcrManager", "OCR warm-up exception", e)
+        } finally {
+            try { dummyBmp.recycle() } catch (_: Throwable) {}
+        }
+    }
+
+    /** Fire-and-forget Latin model load, started once after the first real recognition. */
+    private fun warmUpLatinInBackground() {
+        if (latinWarmUpStarted) return
+        latinWarmUpStarted = true
+        try {
+            val dummyImage = InputImage.fromBitmap(Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888), 0)
+            latinRecognizer.process(dummyImage)
+                .addOnFailureListener { Log.w("OcrManager", "Latin warm-up warning", it) }
+        } catch (e: Throwable) {
+            Log.w("OcrManager", "Latin warm-up exception", e)
         }
     }
 
     /**
-     * Fast, high-accuracy text recognition optimized for mobile screen captures.
+     * Text recognition for mobile screen captures.
+     *
+     * Accuracy-first pipeline (revised):
      * 1. Safely converts hardware bitmaps if needed.
-     * 2. Auto-scales ultra-high resolution screenshots (e.g. 1440x3120) to optimal inference resolution (max 1080px),
-     *    reducing inference latency to ~150ms without losing character accuracy.
-     * 3. Uses strict timeouts (2.5s) with automatic Latin recognizer fallback to ensure OCR never hangs.
-     * 4. Maps bounding boxes back to the original full bitmap coordinates seamlessly.
+     * 2. NEVER downscales the screenshot. The previous implementation capped the
+     *    longest side at 1080 px, which shrank small text on a full-screen capture
+     *    to roughly 9 px per character — far below ML Kit's minimum — and destroyed
+     *    recognition of dense Japanese text.
+     * 3. Splits tall screenshots into overlapping horizontal tiles at native
+     *    resolution, recognizes each tile with the Japanese recognizer, then
+     *    de-duplicates seam lines and renumbers lines in reading order.
+     * 4. Falls back to the Latin recognizer only when the Japanese pass produced
+     *    nothing at all (e.g. a purely Latin screen the Japanese model rejected),
+     *    never on a per-tile timeout.
+     * All returned bounding boxes are in the original full bitmap coordinates.
      */
-    suspend fun recognizeText(bitmap: Bitmap): List<OcrTextItem> = withContext(Dispatchers.Default) {
+    suspend fun recognizeText(
+        bitmap: Bitmap,
+        onPartialResults: ((List<OcrTextItem>) -> Unit)? = null
+    ): List<OcrTextItem> = withContext(Dispatchers.Default) {
         val origW = bitmap.width
         val origH = bitmap.height
         if (origW <= 0 || origH <= 0) return@withContext emptyList()
@@ -92,75 +133,217 @@ class OcrManager {
             bitmap
         }
 
-        val maxDim = max(origW, origH)
-        val targetMaxDim = 1080f
-
-        // Compute optimal inference scaling
-        val (inferenceBitmap, scaleRatio, isScaled) = if (maxDim > targetMaxDim) {
-            val ratio = targetMaxDim / maxDim
-            val targetW = (origW * ratio).toInt().coerceAtLeast(1)
-            val targetH = (origH * ratio).toInt().coerceAtLeast(1)
-            val scaled = try {
-                Bitmap.createScaledBitmap(safeBitmap, targetW, targetH, true)
-            } catch (e: Throwable) {
-                safeBitmap
-            }
-            Triple(scaled, ratio, scaled != safeBitmap)
-        } else {
-            Triple(safeBitmap, 1f, false)
-        }
-
-        val inputImage = try {
-            InputImage.fromBitmap(inferenceBitmap, 0)
-        } catch (e: Throwable) {
-            Log.e("OcrManager", "Failed to create InputImage from bitmap", e)
-            if (isScaled && inferenceBitmap != bitmap && inferenceBitmap != safeBitmap) {
-                try { inferenceBitmap.recycle() } catch (_: Throwable) {}
-            }
-            if (safeBitmap != bitmap) {
-                try { safeBitmap.recycle() } catch (_: Throwable) {}
-            }
-            return@withContext emptyList()
-        }
-
         try {
-            // Attempt Japanese recognizer with a strict 2.5-second timeout
-            val japaneseResult = withTimeoutOrNull(2500L) {
-                runMlKitRecognition(japaneseRecognizer, inputImage, scaleRatio)
-            }
-
-            if (japaneseResult != null && japaneseResult.isNotEmpty()) {
+            val japaneseResult = recognizeInTiles(japaneseRecognizer, safeBitmap, onPartialResults)
+            if (japaneseResult.isNotEmpty()) {
+                warmUpLatinInBackground()
                 return@withContext japaneseResult
             }
 
-            Log.w("OcrManager", "Japanese recognition timed out or returned empty, falling back to Latin recognizer")
-
-            // Fallback to Latin recognizer with a 1.5-second timeout
-            val latinResult = withTimeoutOrNull(1500L) {
-                runMlKitRecognition(latinRecognizer, inputImage, scaleRatio)
-            }
-
-            latinResult ?: emptyList()
+            Log.w("OcrManager", "Japanese recognition returned empty, falling back to Latin recognizer")
+            recognizeInTiles(latinRecognizer, safeBitmap, onPartialResults)
         } finally {
-            if (isScaled && inferenceBitmap != bitmap && inferenceBitmap != safeBitmap) {
-                try { inferenceBitmap.recycle() } catch (_: Throwable) {}
-            }
             if (safeBitmap != bitmap) {
                 try { safeBitmap.recycle() } catch (_: Throwable) {}
             }
         }
     }
 
+    /**
+     * Runs [recognizer] over horizontal tiles of [bitmap] cut at native resolution
+     * and merges the per-tile lines into one de-duplicated, reading-order list
+     * whose boxes are in full-bitmap coordinates.
+     */
+    private suspend fun recognizeInTiles(
+        recognizer: com.google.mlkit.vision.text.TextRecognizer,
+        bitmap: Bitmap,
+        onPartialResults: ((List<OcrTextItem>) -> Unit)? = null
+    ): List<OcrTextItem> {
+        val width = bitmap.width
+        val height = bitmap.height
+
+        // Tile start offsets: 0, then step by (TILE_HEIGHT_PX - TILE_OVERLAP_PX)
+        // until the bottom of the image is covered.
+        val starts = mutableListOf<Int>()
+        if (height <= TILE_HEIGHT_PX) {
+            starts.add(0)
+        } else {
+            var start = 0
+            while (true) {
+                starts.add(start)
+                if (start + TILE_HEIGHT_PX >= height) break
+                start += TILE_HEIGHT_PX - TILE_OVERLAP_PX
+            }
+        }
+
+        val allItems = mutableListOf<OcrTextItem>()
+        for (top in starts) {
+            val tileHeight = min(TILE_HEIGHT_PX, height - top)
+            if (tileHeight <= 0) continue
+
+            val isFullImage = top == 0 && tileHeight == height
+            val tileBitmap = if (isFullImage) {
+                bitmap
+            } else {
+                try {
+                    Bitmap.createBitmap(bitmap, 0, top, width, tileHeight)
+                } catch (e: Throwable) {
+                    Log.e("OcrManager", "Failed to create tile bitmap at y=$top", e)
+                    continue
+                }
+            }
+
+            try {
+                val inputImage = try {
+                    InputImage.fromBitmap(tileBitmap, 0)
+                } catch (e: Throwable) {
+                    Log.e("OcrManager", "Failed to create InputImage for tile at y=$top", e)
+                    null
+                }
+                if (inputImage != null) {
+                    val tileItems = withTimeoutOrNull(TILE_TIMEOUT_MS) {
+                        runMlKitRecognition(recognizer, inputImage, yOffset = top)
+                    }
+                    if (tileItems == null) {
+                        Log.w("OcrManager", "Tile at y=$top timed out after ${TILE_TIMEOUT_MS}ms, skipping tile")
+                    } else {
+                        allItems.addAll(tileItems)
+                        // Progressive display: publish the merged result of
+                        // the tiles finished so far instead of all-or-nothing.
+                        if (onPartialResults != null && starts.size > 1) {
+                            try { onPartialResults(mergeTileResults(allItems.toList())) } catch (_: Throwable) {}
+                        }
+                    }
+                }
+            } finally {
+                if (tileBitmap != bitmap) {
+                    try { tileBitmap.recycle() } catch (_: Throwable) {}
+                }
+            }
+        }
+
+        return mergeTileResults(allItems)
+    }
+
+    /**
+     * De-duplicates lines detected twice in tile overlap zones, sorts the lines
+     * into reading order, and renumbers line/token indices so downstream
+     * selection logic sees one consistent sequence.
+     *
+     * Duplicate rule: two lines whose boxes overlap by at least half of the
+     * smaller box are the same physical line. The longer text wins, because a
+     * line clipped by a tile seam can come back truncated/garbled from one tile
+     * and whole from the next.
+     */
+    fun mergeTileResults(items: List<OcrTextItem>): List<OcrTextItem> {
+        if (items.isEmpty()) return emptyList()
+
+        val kept = mutableListOf<OcrTextItem>()
+        for (item in items.sortedWith(compareBy<OcrTextItem> { it.boundingBox.top }.thenBy { it.boundingBox.left })) {
+            var duplicateIndex = -1
+            for ((index, existing) in kept.withIndex()) {
+                if (boxesMostlyOverlap(existing.boundingBox, item.boundingBox)) {
+                    duplicateIndex = index
+                    break
+                }
+            }
+            if (duplicateIndex < 0) {
+                kept.add(item)
+            } else if (item.text.length > kept[duplicateIndex].text.length) {
+                kept[duplicateIndex] = item
+            }
+        }
+
+        val ordered = sortItemsInReadingOrder(kept)
+
+        var globalTokenIdx = 0
+        return ordered.mapIndexed { lineIdx, item ->
+            val renumberedTokens = item.tokens.map { token ->
+                token.copy(
+                    id = "t_${lineIdx}_${token.tokenIndex}",
+                    lineIndex = lineIdx,
+                    globalIndex = globalTokenIdx++
+                )
+            }
+            item.copy(
+                id = "line_$lineIdx",
+                lineIndex = lineIdx,
+                blockIndex = 0,
+                tokens = renumberedTokens
+            )
+        }
+    }
+
+    private fun boxesMostlyOverlap(a: Rect, b: Rect): Boolean {
+        val overlapW = min(a.right, b.right) - max(a.left, b.left)
+        val overlapH = min(a.bottom, b.bottom) - max(a.top, b.top)
+        if (overlapW <= 0 || overlapH <= 0) return false
+        val overlapArea = overlapW.toLong() * overlapH.toLong()
+        val minArea = min(a.width(), b.width()).toLong() * min(a.height(), b.height()).toLong()
+        if (minArea <= 0L) return false
+        return overlapArea * 2 >= minArea
+    }
+
+    /** Same row-clustering strategy as [sortLinesInReadingOrder], applied to merged items. */
+    private fun sortItemsInReadingOrder(items: List<OcrTextItem>): List<OcrTextItem> {
+        if (items.size <= 1) return items
+
+        val sortedByTop = items.sortedWith(
+            compareBy<OcrTextItem> { it.boundingBox.top }.thenBy { it.boundingBox.left }
+        )
+
+        val rows = mutableListOf<MutableList<OcrTextItem>>()
+        // Running vertical span per row (the old code recomputed it with
+        // minOf/maxOf over the whole row for every item: O(n^2)).
+        val rowTops = mutableListOf<Int>()
+        val rowBottoms = mutableListOf<Int>()
+        for (item in sortedByTop) {
+            val box = item.boundingBox
+            val top = box.top
+            val bottom = box.bottom
+            val height = (bottom - top).coerceAtLeast(1)
+            val centerY = (top + bottom) / 2
+
+            var matchedRow = -1
+            for (r in rows.indices) {
+                val rTop = rowTops[r]
+                val rBottom = rowBottoms[r]
+                val rHeight = (rBottom - rTop).coerceAtLeast(1)
+                val overlapY = max(0, min(bottom, rBottom) - max(top, rTop))
+                val overlapRatio = overlapY.toFloat() / min(height, rHeight)
+                if (overlapRatio >= 0.40f || (centerY in rTop..rBottom)) {
+                    matchedRow = r
+                    break
+                }
+            }
+            if (matchedRow >= 0) {
+                rows[matchedRow].add(item)
+                rowTops[matchedRow] = min(rowTops[matchedRow], top)
+                rowBottoms[matchedRow] = max(rowBottoms[matchedRow], bottom)
+            } else {
+                rows.add(mutableListOf(item))
+                rowTops.add(top)
+                rowBottoms.add(bottom)
+            }
+        }
+
+        rows.sortBy { row -> row.sumOf { it.boundingBox.top } / row.size.coerceAtLeast(1) }
+        for (row in rows) {
+            row.sortBy { it.boundingBox.left }
+        }
+        return rows.flatten()
+    }
+
     private suspend fun runMlKitRecognition(
         recognizer: com.google.mlkit.vision.text.TextRecognizer,
         inputImage: InputImage,
-        scaleRatio: Float
+        yOffset: Int = 0
     ): List<OcrTextItem> = suspendCancellableCoroutine { continuation ->
         recognizer.process(inputImage)
             .addOnSuccessListener { visionText ->
                 if (continuation.isActive) {
                     try {
-                        val result = processVisionText(visionText, scaleRatio)
+                        val result = processVisionText(visionText, yOffset)
                         continuation.resume(result)
                     } catch (e: Throwable) {
                         Log.e("OcrManager", "Error parsing OCR vision text", e)
@@ -176,7 +359,7 @@ class OcrManager {
             }
     }
 
-    private fun processVisionText(visionText: Text, scaleRatio: Float): List<OcrTextItem> {
+    private fun processVisionText(visionText: Text, yOffset: Int = 0): List<OcrTextItem> {
         val items = mutableListOf<OcrTextItem>()
         var globalTokenIdx = 0
         var globalLineIdx = 0
@@ -188,11 +371,9 @@ class OcrManager {
         // 2. Sort all lines strictly into top-to-bottom reading order
         val sortedLines = sortLinesInReadingOrder(rawLines)
 
-        val invScale = if (scaleRatio > 0f && scaleRatio != 1f) 1f / scaleRatio else 1f
-
         for (line in sortedLines) {
             val rawLineBox = line.boundingBox ?: Rect(0, 0, 100, 50)
-            val lineBox = unscaleRect(rawLineBox, invScale)
+            val lineBox = offsetRect(rawLineBox, yOffset)
             val currentLineIdx = globalLineIdx++
             val tokens = mutableListOf<OcrToken>()
             var tokenInLineIdx = 0
@@ -201,7 +382,7 @@ class OcrManager {
             if (elements.isNotEmpty()) {
                 for (element in elements) {
                     val rawElemBox = element.boundingBox ?: rawLineBox
-                    val elementBox = unscaleRect(rawElemBox, invScale)
+                    val elementBox = offsetRect(rawElemBox, yOffset)
                     val elementText = element.text
                     val symbols = try {
                         element.symbols.sortedBy { it.boundingBox?.left ?: 0 }
@@ -209,11 +390,11 @@ class OcrManager {
                         emptyList<Text.Symbol>()
                     }
 
-                    if (symbols.isNotEmpty() && containsJapaneseOrMixed(elementText)) {
+                    if (symbols.isNotEmpty() && containsJapanese(elementText)) {
                         // Use ML Kit direct Symbol bounding boxes for highest character precision
                         for (symbol in symbols) {
                             val rawSymBox = symbol.boundingBox ?: rawElemBox
-                            val symBox = unscaleRect(rawSymBox, invScale)
+                            val symBox = offsetRect(rawSymBox, yOffset)
                             val symText = symbol.text
                             tokens.add(
                                 OcrToken(
@@ -289,7 +470,7 @@ class OcrManager {
                         )
                     }
                 } else {
-                    val words = lineText.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                    val words = lineText.split(WHITESPACE).filter { it.isNotEmpty() }
                     val totalLen = lineText.length.coerceAtLeast(1)
                     var currentOffset = 0
                     for (word in words) {
@@ -333,14 +514,9 @@ class OcrManager {
         return items
     }
 
-    private fun unscaleRect(rect: Rect, invScale: Float): Rect {
-        if (invScale == 1f) return rect
-        return Rect(
-            (rect.left * invScale).toInt(),
-            (rect.top * invScale).toInt(),
-            (rect.right * invScale).toInt(),
-            (rect.bottom * invScale).toInt()
-        )
+    private fun offsetRect(rect: Rect, yOffset: Int): Rect {
+        if (yOffset == 0) return rect
+        return Rect(rect.left, rect.top + yOffset, rect.right, rect.bottom + yOffset)
     }
 
     /**
@@ -358,6 +534,13 @@ class OcrManager {
         )
 
         val rows = mutableListOf<MutableList<Text.Line>>()
+        // Running vertical span of each row's boxed lines. The old code recomputed
+        // it with minOf/maxOf over the whole row for every candidate line
+        // (O(n^2)); a box-less member fell back to the candidate's own top/bottom,
+        // which is reproduced through rowHasBoxless below.
+        val rowTops = mutableListOf<Int>()
+        val rowBottoms = mutableListOf<Int>()
+        val rowHasBoxless = mutableListOf<Boolean>()
 
         for (line in sortedByTop) {
             val box = line.boundingBox ?: Rect(0, 0, 0, 0)
@@ -366,11 +549,11 @@ class OcrManager {
             val height = (bottom - top).coerceAtLeast(1)
             val centerY = (top + bottom) / 2
 
-            var matchedRow: MutableList<Text.Line>? = null
+            var matchedRow = -1
 
-            for (row in rows) {
-                val rTop = row.minOf { it.boundingBox?.top ?: top }
-                val rBottom = row.maxOf { it.boundingBox?.bottom ?: bottom }
+            for (r in rows.indices) {
+                val rTop = if (rowHasBoxless[r]) min(rowTops[r], top) else rowTops[r]
+                val rBottom = if (rowHasBoxless[r]) max(rowBottoms[r], bottom) else rowBottoms[r]
                 val rHeight = (rBottom - rTop).coerceAtLeast(1)
 
                 val overlapY = max(0, min(bottom, rBottom) - max(top, rTop))
@@ -378,15 +561,25 @@ class OcrManager {
 
                 // Overlap by at least 40% of line height or vertical center inside row span
                 if (overlapRatio >= 0.40f || (centerY in rTop..rBottom)) {
-                    matchedRow = row
+                    matchedRow = r
                     break
                 }
             }
 
-            if (matchedRow != null) {
-                matchedRow.add(line)
+            val hasBox = line.boundingBox != null
+            if (matchedRow >= 0) {
+                rows[matchedRow].add(line)
+                if (hasBox) {
+                    rowTops[matchedRow] = min(rowTops[matchedRow], top)
+                    rowBottoms[matchedRow] = max(rowBottoms[matchedRow], bottom)
+                } else {
+                    rowHasBoxless[matchedRow] = true
+                }
             } else {
                 rows.add(mutableListOf(line))
+                rowTops.add(if (hasBox) top else Int.MAX_VALUE)
+                rowBottoms.add(if (hasBox) bottom else Int.MIN_VALUE)
+                rowHasBoxless.add(!hasBox)
             }
         }
 
@@ -401,21 +594,6 @@ class OcrManager {
         }
 
         return rows.flatten()
-    }
-
-    private fun containsJapaneseOrMixed(text: String): Boolean {
-        for (i in 0 until text.length) {
-            val code = text[i].code
-            if (code in 0x3040..0x309F || // Hiragana
-                code in 0x30A0..0x30FF || // Katakana
-                code in 0x4E00..0x9FAF || // Kanji
-                code in 0x3400..0x4DBF || // Kanji Extension A
-                code in 0xFF00..0xFFEF   // Fullwidth
-            ) {
-                return true
-            }
-        }
-        return false
     }
 
     private fun containsJapanese(text: String): Boolean {
