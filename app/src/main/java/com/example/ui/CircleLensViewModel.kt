@@ -97,6 +97,16 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
     private var activeLoadJob: Job? = null
     private var isRealBitmapLoaded: Boolean = false
 
+    /**
+     * Original file of [CircleLensUiState.currentBitmap] when that bitmap was
+     * decoded reduced (very large shared images), so crops can be saved and
+     * shared at the file's full resolution. Null for screenshots, which are
+     * always kept at their native resolution.
+     */
+    private var fullResolutionSource: FullResolutionSource? = null
+
+    private class FullResolutionSource(val bitmap: Bitmap, val uri: Uri, val width: Int, val height: Int)
+
     /** Bitmap whose OCR is running or whose results are in [uiState]. */
     private var ocrBitmap: Bitmap? = null
 
@@ -213,6 +223,7 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         activeLoadJob?.cancel()
         isRealBitmapLoaded = true
         ocrBitmap = bitmap
+        if (fullResolutionSource?.bitmap !== bitmap) fullResolutionSource = null
 
         // ⚡ INSTANT RENDERING: Display bitmap immediately in 0ms without waiting for OCR
         // A new capture starts a fresh translation session. OCR boxes of a
@@ -275,6 +286,7 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
     fun loadBitmapFromUri(uri: Uri) {
         activeLoadJob?.cancel()
         ocrBitmap = null
+        fullResolutionSource = null
         _uiState.update {
             it.copy(
                 isOcrRunning = true,
@@ -286,18 +298,22 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         }
 
         activeLoadJob = viewModelScope.launch {
-            val bitmap = withContext(Dispatchers.IO) {
+            val decoded = withContext(Dispatchers.IO) {
                 try {
-                    // Only very large images are subsampled (see decodeSampledBitmap).
-                    ScreenshotHelper.decodeSampledBitmap(getApplication(), uri)
+                    // Only very large images are subsampled (see decodeSampledImage).
+                    ScreenshotHelper.decodeSampledImage(getApplication(), uri)
                 } catch (e: Throwable) {
                     Log.e("CircleLensVM", "Failed to load image from URI", e)
                     null
                 }
             }
+            val bitmap = decoded?.bitmap
 
             if (bitmap != null) {
                 ocrBitmap = bitmap
+                if (decoded.isSubsampled) {
+                    fullResolutionSource = FullResolutionSource(bitmap, uri, decoded.sourceWidth, decoded.sourceHeight)
+                }
                 try {
                     val ocrResults = ocrManager.recognizeText(bitmap)
                     val flatTokens = ocrResults.flatMap { it.tokens }
@@ -606,7 +622,31 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         crop.croppedBitmap?.let { return it }
         val imageRect = crop.imageRect ?: return null
         val source = _uiState.value.currentBitmap ?: return null
+        fullResolutionCrop(crop.rect, imageRect, source)?.let { return it }
         return withContext(Dispatchers.Default) { extractCropBitmap(crop.rect, imageRect, source) }
+    }
+
+    /**
+     * The crop re-read from the original file at its full resolution, for an
+     * image that is displayed reduced (see [fullResolutionSource]). Null when
+     * the current image is not reduced or the region cannot be decoded; the
+     * caller then cuts the crop from the displayed bitmap.
+     */
+    private suspend fun fullResolutionCrop(cropRectDisplay: RectF, imageRectDisplay: RectF, source: Bitmap): Bitmap? {
+        val full = fullResolutionSource?.takeIf { it.bitmap === source } ?: return null
+        if (imageRectDisplay.width() <= 0f || imageRectDisplay.height() <= 0f) return null
+        val scaleX = full.width / imageRectDisplay.width()
+        val scaleY = full.height / imageRectDisplay.height()
+        val region = Rect(
+            ((cropRectDisplay.left - imageRectDisplay.left) * scaleX).toInt().coerceIn(0, full.width),
+            ((cropRectDisplay.top - imageRectDisplay.top) * scaleY).toInt().coerceIn(0, full.height),
+            ((cropRectDisplay.right - imageRectDisplay.left) * scaleX).toInt().coerceIn(0, full.width),
+            ((cropRectDisplay.bottom - imageRectDisplay.top) * scaleY).toInt().coerceIn(0, full.height)
+        )
+        if (region.width() <= 10 || region.height() <= 10) return null
+        return withContext(Dispatchers.IO) {
+            ScreenshotHelper.decodeFullResolutionRegion(getApplication(), full.uri, region)
+        }
     }
 
     fun updateCropRect(newRect: RectF, imageRectDisplay: RectF) {

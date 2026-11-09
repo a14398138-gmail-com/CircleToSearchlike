@@ -4,6 +4,8 @@ import android.content.ContentUris
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BitmapRegionDecoder
+import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
@@ -125,14 +127,22 @@ object ScreenshotHelper {
         null
     }
 
+    /** A decoded image and the pixel size of the original file it came from. */
+    class DecodedImage(val bitmap: Bitmap, val sourceWidth: Int, val sourceHeight: Int) {
+        /** True when [bitmap] holds fewer pixels than the file (it was subsampled). */
+        val isSubsampled: Boolean
+            get() = sourceWidth > bitmap.width || sourceHeight > bitmap.height
+    }
+
     /**
      * Decodes [uri] subsampled (power-of-two inSampleSize) only when it is
      * larger than MIN_PIXEL_BUDGET (or twice the display, if larger). OCR runs
      * at native resolution for accuracy, so ordinary photos (up to ~16MP) are
      * kept as they are; only very large images (e.g. 50MP, 200MB decoded) are
-     * reduced. Blocking; call on IO.
+     * reduced. Crops of a reduced image are re-read at full resolution with
+     * [decodeFullResolutionRegion]. Blocking; call on IO.
      */
-    fun decodeSampledBitmap(context: Context, uri: Uri): Bitmap? {
+    fun decodeSampledImage(context: Context, uri: Uri): DecodedImage? {
         val resolver = context.contentResolver
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
@@ -149,8 +159,45 @@ object ScreenshotHelper {
         }
 
         val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-        return resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+        val bitmap = resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+            ?: return null
+        // Formats whose bounds pass did not report a size are treated as not reduced.
+        val width = if (bounds.outWidth > 0) bounds.outWidth else bitmap.width
+        val height = if (bounds.outHeight > 0) bounds.outHeight else bitmap.height
+        return DecodedImage(bitmap, width, height)
+    }
+
+    fun decodeSampledBitmap(context: Context, uri: Uri): Bitmap? = decodeSampledImage(context, uri)?.bitmap
+
+    /**
+     * Decodes only [region] (in the file's own pixels) of [uri] at full
+     * resolution. Returns null when the format has no region decoder (e.g.
+     * GIF), the region is too large, or reading fails. Blocking; call on IO.
+     */
+    fun decodeFullResolutionRegion(context: Context, uri: Uri, region: Rect): Bitmap? {
+        if (region.isEmpty || region.width().toLong() * region.height() > MAX_FULL_RES_REGION_PIXELS) return null
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                val decoder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    BitmapRegionDecoder.newInstance(input)
+                } else {
+                    @Suppress("DEPRECATION")
+                    BitmapRegionDecoder.newInstance(input, false)
+                } ?: return@use null
+                try {
+                    decoder.decodeRegion(region, null)
+                } finally {
+                    decoder.recycle()
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w("ScreenshotHelper", "Full-resolution region decode failed", e)
+            null
+        }
     }
 
     private const val MIN_PIXEL_BUDGET = 16_000_000L
+
+    /** 50MP (200MB as ARGB_8888): larger full-resolution crops fall back to the reduced image. */
+    private const val MAX_FULL_RES_REGION_PIXELS = 50_000_000L
 }
