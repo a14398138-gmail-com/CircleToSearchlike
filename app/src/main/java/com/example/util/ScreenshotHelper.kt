@@ -9,32 +9,48 @@ import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.withContext
-import java.io.InputStream
+import java.util.concurrent.atomic.AtomicLong
 
+/**
+ * Single-path screenshot handoff.
+ *
+ * Previously [setScreenshot] both stashed a pending bitmap AND emitted into a
+ * SharedFlow, while three different consumers (ViewModel init collect,
+ * ViewModel init consume, MainActivity.onResume, MainActivity intent
+ * handling) raced to consume it — the same bitmap could be OCR'd twice or
+ * cancel/replace an in-flight load.
+ *
+ * Now there is exactly one channel: a pending bitmap tagged with a
+ * monotonically increasing id. The only consumer is
+ * CircleLensViewModel.loadPendingScreenshotIfNew(), which loads a given id
+ * at most once. Producers only call [setScreenshot]; lifecycle callbacks
+ * only *ask* the ViewModel to check for a new pending screenshot.
+ */
 object CircleLensScreenshotHolder {
     private var pendingScreenshot: Bitmap? = null
-    private val _screenshotFlow = MutableSharedFlow<Bitmap>(replay = 0, extraBufferCapacity = 4)
-    val screenshotFlow: SharedFlow<Bitmap> = _screenshotFlow.asSharedFlow()
+    private var pendingId: Long = 0L
+    private val idSeq = AtomicLong(0L)
 
     @Synchronized
     fun setScreenshot(bitmap: Bitmap) {
         pendingScreenshot = bitmap
-        _screenshotFlow.tryEmit(bitmap)
+        pendingId = idSeq.incrementAndGet()
+    }
+
+    /** Returns (id, bitmap) of the pending screenshot without consuming it. */
+    @Synchronized
+    fun peekPending(): Pair<Long, Bitmap>? {
+        val bmp = pendingScreenshot ?: return null
+        return pendingId to bmp
     }
 
     @Synchronized
-    fun consumeScreenshot(): Bitmap? {
-        val bmp = pendingScreenshot
-        pendingScreenshot = null
-        return bmp
+    fun clearIf(id: Long) {
+        if (pendingId == id) {
+            pendingScreenshot = null
+        }
     }
-
-    @Synchronized
-    fun peekScreenshot(): Bitmap? = pendingScreenshot
 
     @Synchronized
     fun hasPendingScreenshot(): Boolean = pendingScreenshot != null
@@ -48,37 +64,56 @@ object CircleLensScreenshotHolder {
 object ScreenshotHelper {
 
     /**
-     * Attempts to query the most recently saved screenshot from MediaStore
-     * (e.g., if taken recently within the last 60 seconds).
+     * Last-resort fallback: query MediaStore for a *recent screenshot*.
+     *
+     * Strict matching (the previous `isRecent || isScreenshotName` adopted
+     * years-old screenshots by name alone, or any ordinary photo taken
+     * within 5 minutes): a candidate must satisfy ALL of
+     *  - added within the last 120 seconds, AND
+     *  - file name contains "screenshot", AND
+     *  - (on Android 10+) its relative path contains "screenshot" when the
+     *    column is available.
+     * The first few rows are scanned so a just-taken ordinary photo in row 0
+     * no longer hides a real screenshot in row 1.
      */
     suspend fun getLatestDeviceScreenshot(context: Context): Bitmap? = withContext(Dispatchers.IO) {
         try {
-            val projection = arrayOf(
+            val projection = mutableListOf(
                 MediaStore.Images.Media._ID,
                 MediaStore.Images.Media.DISPLAY_NAME,
-                MediaStore.Images.Media.DATE_ADDED,
-                MediaStore.Images.Media.DATE_MODIFIED
+                MediaStore.Images.Media.DATE_ADDED
             )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                projection.add(MediaStore.Images.Media.RELATIVE_PATH)
+            }
 
             val uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
             val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
 
-            context.contentResolver.query(uri, projection, null, null, sortOrder)?.use { cursor ->
+            context.contentResolver.query(uri, projection.toTypedArray(), null, null, sortOrder)?.use { cursor ->
                 val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
                 val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
                 val dateColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+                val pathColumn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    cursor.getColumnIndex(MediaStore.Images.Media.RELATIVE_PATH)
+                } else {
+                    -1
+                }
 
-                if (cursor.moveToFirst()) {
-                    val id = cursor.getLong(idColumn)
+                val nowSec = System.currentTimeMillis() / 1000
+                var rowsChecked = 0
+                while (cursor.moveToNext() && rowsChecked < 5) {
+                    rowsChecked++
                     val name = cursor.getString(nameColumn) ?: ""
                     val dateAddedSec = cursor.getLong(dateColumn)
-                    val nowSec = System.currentTimeMillis() / 1000
+                    val relPath = if (pathColumn >= 0) cursor.getString(pathColumn) ?: "" else ""
 
-                    // If it was added recently (within 5 minutes) or has "screenshot" in name
-                    val isRecent = (nowSec - dateAddedSec) < 300
-                    val isScreenshotName = name.lowercase().contains("screenshot") || name.lowercase().contains("screen")
+                    val isRecent = (nowSec - dateAddedSec) in 0..120
+                    val isScreenshotName = name.lowercase().contains("screenshot")
+                    val isScreenshotPath = relPath.isEmpty() || relPath.lowercase().contains("screenshot")
 
-                    if (isRecent || isScreenshotName) {
+                    if (isRecent && isScreenshotName && isScreenshotPath) {
+                        val id = cursor.getLong(idColumn)
                         val contentUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
                         return@withContext decodeSampledBitmap(context, contentUri)
                     }
@@ -91,11 +126,11 @@ object ScreenshotHelper {
     }
 
     /**
-     * Decodes [uri] subsampled (power-of-two inSampleSize) so the bitmap holds at
-     * most about twice the display's pixel count. Gallery images and shared
-     * photos are often 12-50MP: decoding them at full size cost hundreds of
-     * milliseconds and 50-200MB, although the image is only shown fitted to
-     * the screen and OCR downscales to 1080px anyway. Blocking; call on IO.
+     * Decodes [uri] subsampled (power-of-two inSampleSize) only when it is
+     * larger than MIN_PIXEL_BUDGET (or twice the display, if larger). OCR runs
+     * at native resolution for accuracy, so ordinary photos (up to ~16MP) are
+     * kept as they are; only very large images (e.g. 50MP, 200MB decoded) are
+     * reduced. Blocking; call on IO.
      */
     fun decodeSampledBitmap(context: Context, uri: Uri): Bitmap? {
         val resolver = context.contentResolver
@@ -117,5 +152,5 @@ object ScreenshotHelper {
         return resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
     }
 
-    private const val MIN_PIXEL_BUDGET = 4_000_000L
+    private const val MIN_PIXEL_BUDGET = 16_000_000L
 }

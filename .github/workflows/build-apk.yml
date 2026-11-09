@@ -1,6 +1,8 @@
 name: Build Android APK
 
-# Builds the debug APK (signed with DEBUG_KEYSTORE_BASE64), publishes it as a
+# Runs the unit tests and builds the debug APK (signed with
+# DEBUG_KEYSTORE_BASE64, including the PLaMo translation engine built from
+# llama.cpp), publishes it as a
 # GitHub Release asset and posts the direct .apk download link (not the zipped
 # Actions artifact) to DISCORD_WEBHOOK_URL.
 #   - pull requests from this repository: pre-release "pr-<number>", replaced on
@@ -70,8 +72,27 @@ jobs:
             keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      - name: Checkout llama.cpp (native translation engine)
+        # Pinned release so the native API used by app/src/main/cpp/llama_jni.cpp
+        # (byte-identical with PDF-viewer2's) cannot drift. Without this
+        # checkout the APK ships without libplamo_llama.so and translation
+        # fails to load its engine.
+        run: git clone --depth 1 --branch v0.9.0 https://github.com/ggml-org/llama.cpp llama.cpp
+
       - name: Build Debug APK
-        run: gradle :app:assembleDebug --stacktrace
+        env:
+          LLAMA_CPP_DIR: ${{ github.workspace }}/llama.cpp
+        run: gradle :app:testDebugUnitTest :app:assembleDebug --stacktrace
+
+      - name: Check the translation engine is packaged
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          if unzip -l "$APK" | grep -q 'lib/arm64-v8a/libplamo_llama.so'; then
+            echo "libplamo_llama.so is packaged."
+          else
+            echo "::error::lib/arm64-v8a/libplamo_llama.so is missing from the APK (translation would not work)."
+            exit 1
+          fi
 
       - name: Verify APK signature
         # Confirms the APK is signed with debug.keystore (from

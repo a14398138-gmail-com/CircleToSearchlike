@@ -2,13 +2,14 @@ package com.example.ui
 
 import android.graphics.Bitmap
 import android.graphics.RectF
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -83,27 +84,23 @@ fun CircleLensOverlayCanvas(
     onCropFrameUpdated: (RectF, RectF) -> Unit,
     onImageRectCalculated: (RectF) -> Unit
 ) {
-    // The animation values are passed down as State and only read inside draw
-    // lambdas, so the infinite animation never recomposes anything.
-    val infiniteTransition = rememberInfiniteTransition(label = "auroraGlow")
-    val phase = infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(2000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "dashPhase"
-    )
-    val pulsePhase = infiniteTransition.animateFloat(
-        initialValue = 0.88f,
-        targetValue = 1.12f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(2200, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulsePhase"
-    )
+    // Aurora animation runs ONLY while the user is interacting (an active
+    // stroke, a text selection, or a crop frame); an idle screen does not
+    // redraw. The values are passed down as State and only read inside the
+    // layers' draw lambdas, so while animating nothing recomposes either.
+    val auroraActive = activeStrokePoints.isNotEmpty() || textSelection != null || cropSelection != null
+    val phaseAnim = remember { Animatable(0f) }
+    val pulseAnim = remember { Animatable(0.88f) }
+    LaunchedEffect(auroraActive) {
+        if (auroraActive) {
+            launchPhases(phaseAnim, pulseAnim)
+        } else {
+            phaseAnim.snapTo(0f)
+            pulseAnim.snapTo(0.88f)
+        }
+    }
+    val phase = phaseAnim.asState()
+    val pulsePhase = pulseAnim.asState()
 
     val currentBitmap by rememberUpdatedState(bitmap)
     val currentTextSelection by rememberUpdatedState(textSelection)
@@ -750,5 +747,29 @@ private fun DrawScope.drawSelectionPin(pinPoint: Offset, isStart: Boolean) {
         drawCircle(color = Color.White, radius = pinRadius + 2.5f, center = center)
         drawCircle(color = pinColor, radius = pinRadius, center = center)
         drawCircle(color = Color.White, radius = 5f, center = center)
+    }
+}
+
+/** Drives the aurora phase/pulse animatables while interaction is active. */
+private suspend fun launchPhases(phaseAnim: Animatable<Float, *>, pulseAnim: Animatable<Float, *>) {
+    kotlinx.coroutines.coroutineScope {
+        launch {
+            phaseAnim.animateTo(
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(2000, easing = LinearEasing),
+                    repeatMode = RepeatMode.Restart
+                )
+            )
+        }
+        launch {
+            pulseAnim.animateTo(
+                targetValue = 1.12f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(2200, easing = FastOutSlowInEasing),
+                    repeatMode = RepeatMode.Reverse
+                )
+            )
+        }
     }
 }

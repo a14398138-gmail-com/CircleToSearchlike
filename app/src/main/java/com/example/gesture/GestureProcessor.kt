@@ -214,6 +214,79 @@ object GestureProcessor {
 
         return bestToken
     }
+
+    /**
+     * [findTokensInStroke] for an arbitrary bitmap-to-display transform
+     * (allocates one RectF per token; the app uses the [ImageToDisplayMapping]
+     * overload).
+     */
+    fun findTokensInStroke(
+        strokePoints: List<Offset>,
+        allTokens: List<OcrToken>,
+        imageToDisplayTransform: (Rect) -> RectF
+    ): Pair<Int, Int>? {
+        if (strokePoints.isEmpty() || allTokens.isEmpty()) return null
+
+        val touchedGlobalIndices = mutableListOf<Int>()
+        val tolerance = 32f // Touch tolerance for finger strokes
+
+        for (token in allTokens) {
+            val displayBox = imageToDisplayTransform(token.boundingBox)
+            val expanded = RectF(
+                displayBox.left - tolerance,
+                displayBox.top - tolerance,
+                displayBox.right + tolerance,
+                displayBox.bottom + tolerance
+            )
+            for (pt in strokePoints) {
+                if (expanded.contains(pt.x, pt.y)) {
+                    touchedGlobalIndices.add(token.globalIndex)
+                    break
+                }
+            }
+        }
+
+        if (touchedGlobalIndices.isEmpty()) return null
+
+        val minIdx = touchedGlobalIndices.minOrNull() ?: return null
+        val maxIdx = touchedGlobalIndices.maxOrNull() ?: return null
+        return Pair(minIdx, maxIdx)
+    }
+
+    /** [findClosestToken] for an arbitrary bitmap-to-display transform. */
+    fun findClosestToken(
+        point: Offset,
+        allTokens: List<OcrToken>,
+        imageToDisplayTransform: (Rect) -> RectF
+    ): OcrToken? {
+        if (allTokens.isEmpty()) return null
+
+        var bestToken: OcrToken? = null
+        var minScore = Float.MAX_VALUE
+
+        for (token in allTokens) {
+            val displayBox = imageToDisplayTransform(token.boundingBox)
+
+            val vDist = when {
+                point.y in (displayBox.top - 8f)..(displayBox.bottom + 8f) -> 0f
+                point.y < displayBox.top -> displayBox.top - point.y
+                else -> point.y - displayBox.bottom
+            }
+            val hDist = when {
+                point.x in displayBox.left..displayBox.right -> 0f
+                point.x < displayBox.left -> displayBox.left - point.x
+                else -> point.x - displayBox.right
+            }
+            val distScore = hypot(hDist.toDouble(), (vDist * 2.2).toDouble()).toFloat()
+
+            if (distScore < minScore) {
+                minScore = distScore
+                bestToken = token
+            }
+        }
+
+        return bestToken
+    }
 }
 
 /**

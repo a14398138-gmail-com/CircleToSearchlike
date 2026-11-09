@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -50,7 +51,6 @@ class ShareManager private constructor(context: Context) {
     private val _recentImageShareTargets = MutableStateFlow<List<ShareTarget>>(emptyList())
     val recentImageShareTargets: StateFlow<List<ShareTarget>> = _recentImageShareTargets.asStateFlow()
 
-    // Declared before init: loadPersistedTargets() reads them.
     /** Serialized writer for the first-frame snapshot (see [quickSnapshot]). */
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     private val snapshotScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
@@ -62,9 +62,28 @@ class ShareManager private constructor(context: Context) {
     private val maxIconSizePx: Int =
         (ICON_MAX_SIZE_DP * appContext.resources.displayMetrics.density).toInt().coerceAtLeast(48)
 
-    init {
-        loadPersistedTargets()
+    // Loading persisted targets queries PackageManager (labels and icons), far
+    // too heavy for the main thread, so construction is cheap and [initialize]
+    // runs the load once on an IO dispatcher.
+    @Volatile
+    private var initialized = false
+    private val initMutex = kotlinx.coroutines.sync.Mutex()
+
+    suspend fun initialize() = withContext(Dispatchers.IO) {
+        if (initialized) return@withContext
+        initMutex.withLock {
+            if (initialized) return@withLock
+            loadPersistedTargets()
+            initialized = true
+        }
     }
+
+    /**
+     * Share targets already queried by [getAvailableShareTargets] (never
+     * triggers the query itself; empty until something needed the full list).
+     */
+    fun cachedAvailableTargets(isImage: Boolean): List<ShareTarget> =
+        availableTargetsCache[if (isImage) "image/*" else "text/plain"]?.second.orEmpty()
 
     /** Share targets known without touching PackageManager, for the first frame. */
     data class QuickSnapshot(
@@ -96,13 +115,13 @@ class ShareManager private constructor(context: Context) {
 
         /**
          * The last text/image share targets, available synchronously and cheaply
-         * enough for the first frame: the live values when ShareManager already
-         * exists in this process, otherwise the snapshot saved on disk (two small
+         * enough for the first frame: the live values once ShareManager has
+         * been initialized in this process, otherwise the snapshot saved on disk (two small
          * PNG decodes). Loading them through PackageManager takes long enough
          * that the share button used to appear a beat after the screen.
          */
         fun quickSnapshot(context: Context): QuickSnapshot {
-            instance?.let { sm ->
+            instance?.takeIf { it.initialized }?.let { sm ->
                 return QuickSnapshot(
                     sm._lastTextShareTarget.value,
                     sm._lastImageShareTarget.value,

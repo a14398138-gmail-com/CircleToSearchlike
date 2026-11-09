@@ -2,6 +2,7 @@ package com.example.ui
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.graphics.Rect
 import android.graphics.RectF
 import android.net.Uri
 import android.util.Log
@@ -15,8 +16,10 @@ import com.example.model.OcrTextItem
 import com.example.model.OcrToken
 import com.example.model.ShareTarget
 import com.example.model.TextSelectionState
+import com.example.model.TextJoiner
 import com.example.model.TrailPoint
 import com.example.ocr.OcrManager
+import com.example.translate.TranslateController
 import com.example.share.ShareManager
 import com.example.util.CircleLensScreenshotHolder
 import com.example.util.ScreenshotHelper
@@ -51,21 +54,32 @@ data class CircleLensUiState(
     val showTargetPickerSheet: Boolean = false,
     val targetPickerIsImage: Boolean = false,
     val showAssistHelpSheet: Boolean = false,
-    val feedbackMessage: String? = null
+    val feedbackMessage: String? = null,
+    // Translation session state lives in the ViewModel (not `remember`) so
+    // rotation / Activity recreation no longer loses the source text, the
+    // translation, or the language pair while OCR state survives.
+    val translateSourceText: String? = null,
+    val translateResult: String? = null,
+    val translateSrcLang: String = "ja",
+    val translateTgtLang: String = "en"
 )
 
 class CircleLensViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val ocrManager = OcrManager()
+    companion object {
+        /** Crops smaller than this (in px, longest side) are upscaled before re-OCR. */
+        private const val CROP_OCR_TARGET_MAX_DIM = 1600
 
-    // Created lazily, off the main thread (see init): ShareManager's constructor
-    // reads SharedPreferences and resolves the recent targets' labels/icons
-    // through PackageManager, which used to block the first frame.
-    val shareManager: ShareManager by lazy { ShareManager.getInstance(application) }
+        /** Upper bound for the crop upscale factor. */
+        private const val CROP_OCR_MAX_UPSCALE = 2.5f
+    }
+
+    private val ocrManager = OcrManager()
+    val shareManager = ShareManager.getInstance(application)
 
     // The last share targets come from ShareManager's cheap snapshot, so the
     // direct-share button is laid out in the first frame instead of popping in
-    // once the full ShareManager has loaded in the background.
+    // once ShareManager has loaded in the background.
     private val _uiState = MutableStateFlow(
         ShareManager.quickSnapshot(application).let { snapshot ->
             CircleLensUiState(
@@ -87,36 +101,39 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
     private var ocrBitmap: Bitmap? = null
 
     init {
-        // Observe share targets and recent history. All state writes go through
-        // _uiState.update {} because they happen on several threads.
-        viewModelScope.launch(Dispatchers.Default) {
-            val sm = shareManager
+        // Share targets: one IO initialisation inside ShareManager (its
+        // constructor does no PackageManager/icon work). Its flows are only
+        // collected once it is initialized: before that they are still empty
+        // and would overwrite the snapshot shown in the first frame.
+        // All state writes use _uiState.update {}: OCR tile results and these
+        // collectors run on other threads than the UI callbacks.
+        viewModelScope.launch {
+            shareManager.initialize()
+            _uiState.update {
+                it.copy(
+                    availableTextTargets = shareManager.cachedAvailableTargets(isImage = false),
+                    availableImageTargets = shareManager.cachedAvailableTargets(isImage = true)
+                )
+            }
             launch {
-                sm.lastTextShareTarget.collect { target ->
+                shareManager.lastTextShareTarget.collect { target ->
                     _uiState.update { it.copy(lastTextShareTarget = target) }
                 }
             }
             launch {
-                sm.lastImageShareTarget.collect { target ->
+                shareManager.lastImageShareTarget.collect { target ->
                     _uiState.update { it.copy(lastImageShareTarget = target) }
                 }
             }
             launch {
-                sm.recentTextShareTargets.collect { list ->
+                shareManager.recentTextShareTargets.collect { list ->
                     _uiState.update { it.copy(recentTextTargets = list) }
                 }
             }
             launch {
-                sm.recentImageShareTargets.collect { list ->
+                shareManager.recentImageShareTargets.collect { list ->
                     _uiState.update { it.copy(recentImageTargets = list) }
                 }
-            }
-        }
-
-        // Observe incoming assistant screenshots in real time
-        viewModelScope.launch {
-            CircleLensScreenshotHolder.screenshotFlow.collect { bitmap ->
-                loadBitmapDirect(bitmap, null)
             }
         }
 
@@ -125,17 +142,32 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
             ocrManager.warmUp()
         }
 
-        // The full list of share targets (every app's label + icon) is only
-        // needed by the target picker, so it is loaded on demand in
-        // showTargetPicker() instead of on every launch.
-
-        // If there is already a captured screenshot pending, load it immediately
-        val captured = CircleLensScreenshotHolder.consumeScreenshot()
-        if (captured != null) {
-            loadBitmapDirect(captured, null)
-        }
+        // Single screenshot consumer path: only this method ever loads a
+        // pending screenshot, and each screenshot id is loaded at most once.
+        loadPendingScreenshotIfNew()
     }
 
+    private var lastLoadedScreenshotId: Long = 0L
+
+    /**
+     * The one and only entry point for assistant screenshots. Lifecycle
+     * callbacks (MainActivity.onResume / intent handling) call this instead
+     * of consuming the holder themselves, so the same bitmap can never be
+     * loaded (and OCR'd) twice.
+     */
+    fun loadPendingScreenshotIfNew() {
+        val pending = CircleLensScreenshotHolder.peekPending() ?: return
+        val (id, bitmap) = pending
+        if (id == lastLoadedScreenshotId) return
+        lastLoadedScreenshotId = id
+        CircleLensScreenshotHolder.clearIf(id)
+        loadBitmapDirect(bitmap, null)
+    }
+
+    /**
+     * Full list of share targets (every app's label + icon). Only the target
+     * picker needs it, so it is queried on demand (see [showTargetPicker]).
+     */
     fun refreshAvailableTargets() {
         viewModelScope.launch(Dispatchers.IO) {
             val textTargets = shareManager.getAvailableShareTargets("text/plain")
@@ -153,9 +185,8 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
      * Called when invoked via Assist / Home long-press
      */
     fun onAssistLaunched() {
-        val captured = CircleLensScreenshotHolder.consumeScreenshot()
-        if (captured != null) {
-            loadBitmapDirect(captured, null)
+        if (CircleLensScreenshotHolder.hasPendingScreenshot()) {
+            loadPendingScreenshotIfNew()
             return
         }
 
@@ -166,16 +197,15 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
             if (recent != null) {
                 loadBitmapDirect(recent, null)
             } else if (_uiState.value.currentBitmap == null) {
-                _uiState.update { it.copy(feedbackMessage = "画面を取得中...") }
+                _uiState.update { it.copy(
+                    feedbackMessage = "画面を取得中..."
+                ) }
             }
         }
     }
 
     fun loadBitmapDirect(bitmap: Bitmap, message: String? = null) {
-        // The same screenshot reaches us through several paths (holder flow,
-        // onCreate/onNewIntent, onResume). Restarting OCR for it cancelled the
-        // in-flight recognition and queued a second one behind it in ML Kit,
-        // roughly doubling time-to-text on warm launches.
+        // Same bitmap already recognized or being recognized: nothing to do.
         if (bitmap === ocrBitmap && (activeLoadJob?.isActive == true || !_uiState.value.isOcrRunning)) {
             return
         }
@@ -184,9 +214,10 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         isRealBitmapLoaded = true
         ocrBitmap = bitmap
 
-        // ⚡ INSTANT RENDERING: Display bitmap immediately in 0ms without waiting for OCR.
-        // OCR boxes of a previous screenshot are dropped so they are not drawn
-        // (or hit-tested) on top of the new one while recognition runs.
+        // ⚡ INSTANT RENDERING: Display bitmap immediately in 0ms without waiting for OCR
+        // A new capture starts a fresh translation session. OCR boxes of a
+        // previous screenshot are dropped so they are not drawn (or hit-tested)
+        // on top of the new one while recognition runs.
         _uiState.update {
             val sameBitmap = it.currentBitmap === bitmap
             it.copy(
@@ -197,13 +228,24 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
                 textSelection = null,
                 activeCropSelection = null,
                 activeStrokePoints = emptyList(),
-                feedbackMessage = message
+                feedbackMessage = message,
+                translateSourceText = null,
+                translateResult = null
             )
         }
 
         activeLoadJob = viewModelScope.launch {
             try {
-                val ocrResults = ocrManager.recognizeText(bitmap)
+                // Progressive: finished tiles are published as they complete
+                // (from a background thread, hence update {} and the bitmap check).
+                val ocrResults = ocrManager.recognizeText(bitmap) { partial ->
+                    _uiState.update {
+                        if (it.currentBitmap !== bitmap) it else it.copy(
+                            ocrItems = partial,
+                            allTokens = partial.flatMap { item -> item.tokens }
+                        )
+                    }
+                }
                 val flatTokens = ocrResults.flatMap { it.tokens }
 
                 _uiState.update {
@@ -215,8 +257,8 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
                     )
                 }
             } catch (e: CancellationException) {
-                // Superseded by a newer load: it owns the state now. (The old
-                // catch-all reverted currentBitmap to this stale bitmap.)
+                // Superseded by a newer load, which owns the state now. (A
+                // catch-all here used to revert currentBitmap to this stale bitmap.)
                 throw e
             } catch (e: Throwable) {
                 Log.e("CircleLensVM", "OCR execution error", e)
@@ -246,8 +288,7 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         activeLoadJob = viewModelScope.launch {
             val bitmap = withContext(Dispatchers.IO) {
                 try {
-                    // Decoded with subsampling: shared photos can be 12-50MP,
-                    // far beyond what is displayed or fed to OCR (max 1080px).
+                    // Only very large images are subsampled (see decodeSampledBitmap).
                     ScreenshotHelper.decodeSampledBitmap(getApplication(), uri)
                 } catch (e: Throwable) {
                     Log.e("CircleLensVM", "Failed to load image from URI", e)
@@ -294,13 +335,20 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    // Stroke trajectory is held in a plain local buffer, not rebuilt into
+    // uiState on every pointer event (the old `activeStrokePoints + point`
+    // copied the whole list per event = O(n^2) over a long stroke). The
+    // Canvas also keeps its own local copy for drawing; this buffer is the
+    // authoritative list consumed at stroke end.
+    private val strokeBuffer = mutableListOf<Offset>()
+
     fun onStrokeStart(point: Offset) {
-        _uiState.update {
-            it.copy(
-                activeStrokePoints = listOf(point),
-                trailPoints = listOf(TrailPoint(position = point))
-            )
-        }
+        strokeBuffer.clear()
+        strokeBuffer.add(point)
+        _uiState.update { it.copy(
+            activeStrokePoints = strokeBuffer.toList(),
+            trailPoints = listOf(TrailPoint(position = point))
+        ) }
     }
 
     fun onStrokeMove(
@@ -309,13 +357,13 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         bitmapWidth: Int,
         bitmapHeight: Int
     ) {
-        // Only update trajectory points and trail while drawing to prevent accidental text selection
-        _uiState.update {
-            it.copy(
-                activeStrokePoints = it.activeStrokePoints + point,
-                trailPoints = (it.trailPoints + TrailPoint(position = point)).takeLast(40)
-            )
-        }
+        strokeBuffer.add(point)
+        // One snapshot copy per event (for Compose state), appended to the
+        // local buffer above; the trail keeps only its last 40 points.
+        _uiState.update { it.copy(
+            activeStrokePoints = strokeBuffer.toList(),
+            trailPoints = (it.trailPoints + TrailPoint(position = point)).takeLast(40)
+        ) }
     }
 
     fun onStrokeEnd(
@@ -323,8 +371,8 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         bitmapWidth: Int,
         bitmapHeight: Int
     ) {
+        val points = strokeBuffer.toList()
         val state = _uiState.value
-        val points = state.activeStrokePoints
 
         if (points.isEmpty()) return
 
@@ -339,16 +387,14 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
             if (clampedRight > clampedLeft + 30f && clampedBottom > clampedTop + 30f) {
                 val cropFrame = RectF(clampedLeft, clampedTop, clampedRight, clampedBottom)
 
-                _uiState.update {
-                    it.copy(
-                        // Pixels are cut out lazily when the crop is shared/copied.
-                        activeCropSelection = CropSelection(rect = cropFrame, imageRect = RectF(imageRectOnDisplay)),
-                        textSelection = null,
-                        activeStrokePoints = emptyList(),
-                        trailPoints = emptyList(),
-                        feedbackMessage = "画像を切り抜きました"
-                    )
-                }
+                _uiState.update { it.copy(
+                    // Pixels are cut out lazily when the crop is shared/copied.
+                    activeCropSelection = CropSelection(rect = cropFrame, imageRect = RectF(imageRectOnDisplay)),
+                    textSelection = null,
+                    activeStrokePoints = emptyList(),
+                    trailPoints = emptyList(),
+                    feedbackMessage = "画像を切り抜きました"
+                ) }
                 return
             }
         }
@@ -390,14 +436,12 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
             state.activeCropSelection
         }
 
-        _uiState.update {
-            it.copy(
-                activeStrokePoints = emptyList(),
-                trailPoints = emptyList(),
-                textSelection = finalSelection,
-                activeCropSelection = newCropSelection
-            )
-        }
+        _uiState.update { it.copy(
+            activeStrokePoints = emptyList(),
+            trailPoints = emptyList(),
+            textSelection = finalSelection,
+            activeCropSelection = newCropSelection
+        ) }
     }
 
     /** Clamped, ordered token range exactly as [buildTextSelection] stores it. */
@@ -419,8 +463,8 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         val maxIdx = range.last
         if (minIdx > maxIdx) return null
 
-        // OcrManager assigns globalIndex sequentially, so allTokens[i].globalIndex == i
-        // and the selection is a contiguous slice (no full scan per drag event).
+        // globalIndex is assigned sequentially (allTokens[i].globalIndex == i),
+        // so the selection is a contiguous slice: no full scan per drag event.
         val selected = if (all[minIdx].globalIndex == minIdx && all[maxIdx].globalIndex == maxIdx) {
             all.subList(minIdx, maxIdx + 1)
         } else {
@@ -428,34 +472,50 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         }
         if (selected.isEmpty()) return null
 
-        val mapping = ImageToDisplayMapping.of(imageRectOnDisplay, bitmapWidth, bitmapHeight)
+        val scaleX = imageRectOnDisplay.width() / bitmapWidth
+        val scaleY = imageRectOnDisplay.height() / bitmapHeight
 
         val firstToken = selected.first()
         val lastToken = selected.last()
 
-        // Concatenate text intelligently (add newline between lines, space between English words, no space for Japanese chars)
-        val sb = StringBuilder()
-        var lastLineIdx = -1
-        for (i in selected.indices) {
-            val token = selected[i]
-            if (lastLineIdx != -1 && token.lineIndex != lastLineIdx) {
-                sb.append("\n")
-            } else if (i > 0 && !selected[i - 1].isJapaneseOrCjk && !token.isJapaneseOrCjk) {
-                sb.append(" ")
-            }
-            sb.append(token.text)
-            lastLineIdx = token.lineIndex
-        }
+        val startDisplayBox = RectF(
+            imageRectOnDisplay.left + firstToken.boundingBox.left * scaleX,
+            imageRectOnDisplay.top + firstToken.boundingBox.top * scaleY,
+            imageRectOnDisplay.left + firstToken.boundingBox.right * scaleX,
+            imageRectOnDisplay.top + firstToken.boundingBox.bottom * scaleY
+        )
+
+        val endDisplayBox = RectF(
+            imageRectOnDisplay.left + lastToken.boundingBox.left * scaleX,
+            imageRectOnDisplay.top + lastToken.boundingBox.top * scaleY,
+            imageRectOnDisplay.left + lastToken.boundingBox.right * scaleX,
+            imageRectOnDisplay.top + lastToken.boundingBox.bottom * scaleY
+        )
+
+        val joinedText = joinSelectedText(selected)
 
         return TextSelectionState(
             startTokenIndex = minIdx,
             endTokenIndex = maxIdx,
             selectedTokens = selected,
-            fullText = sb.toString(),
-            startPinPoint = Offset(mapping.toDisplayX(firstToken.boundingBox.left), mapping.toDisplayY(firstToken.boundingBox.top)),
-            endPinPoint = Offset(mapping.toDisplayX(lastToken.boundingBox.right), mapping.toDisplayY(lastToken.boundingBox.bottom))
+            fullText = joinedText,
+            startPinPoint = Offset(startDisplayBox.left, startDisplayBox.top),
+            endPinPoint = Offset(endDisplayBox.right, endDisplayBox.bottom)
         )
     }
+
+    /**
+     * Concatenates tokens into selection text: newline between lines, no space
+     * around Japanese/CJK tokens, and for Latin/digit tokens a space only when
+     * the physical gap between the token boxes is wide enough to be a real word
+     * space.
+     *
+     * The previous rule inserted a space between *every* pair of non-CJK
+     * tokens, which shredded symbol-split sequences into things like
+     * "2 0 2 5 / 0 4 / 2 1" and "m y way" whenever ML Kit returned a Latin word
+     * or a number as individual character symbols.
+     */
+    private fun joinSelectedText(selected: List<OcrToken>): String = TextJoiner.join(selected)
 
     /**
      * Dragging start handle (pin) to update selection start.
@@ -556,28 +616,24 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun clearSelection() {
-        _uiState.update {
-            it.copy(
-                textSelection = null,
-                activeCropSelection = null,
-                activeStrokePoints = emptyList(),
-                trailPoints = emptyList(),
-                feedbackMessage = null
-            )
-        }
+        _uiState.update { it.copy(
+            textSelection = null,
+            activeCropSelection = null,
+            activeStrokePoints = emptyList(),
+            trailPoints = emptyList(),
+            feedbackMessage = null
+        ) }
     }
 
     fun selectAllText(imageRectDisplay: RectF, bitmapWidth: Int, bitmapHeight: Int) {
         val all = _uiState.value.allTokens
         if (all.isNotEmpty()) {
             val sel = buildTextSelection(0, all.size - 1, imageRectDisplay, bitmapWidth, bitmapHeight)
-            _uiState.update {
-                it.copy(
-                    textSelection = sel,
-                    activeCropSelection = null,
-                    feedbackMessage = "全テキストを選択しました (${sel?.selectedTokens?.size}要素)"
-                )
-            }
+            _uiState.update { it.copy(
+                textSelection = sel,
+                activeCropSelection = null,
+                feedbackMessage = "全テキストを選択しました (${sel?.selectedTokens?.size}要素)"
+            ) }
         }
     }
 
@@ -629,44 +685,164 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    /**
+     * Re-runs OCR on just the circled region instead of reusing the full-screen
+     * result. The crop is cut from the original bitmap, upscaled when small so
+     * glyphs get more pixels, and recognized on its own — the region the user
+     * explicitly cared about gets a second, better look, which fixes many
+     * one-character errors the full-screen pass made.
+     *
+     * If the re-run finds nothing, it falls back to the previous behaviour of
+     * selecting the full-screen tokens inside the frame.
+     */
     fun ocrInsideCrop(imageRectDisplay: RectF, bitmapWidth: Int, bitmapHeight: Int) {
         val crop = _uiState.value.activeCropSelection ?: return
-        val all = _uiState.value.allTokens
-        if (all.isEmpty()) return
+        val source = _uiState.value.currentBitmap ?: return
+        if (_uiState.value.isOcrRunning) return
+        if (imageRectDisplay.width() <= 0f || imageRectDisplay.height() <= 0f) return
 
         val scaleX = bitmapWidth / imageRectDisplay.width()
         val scaleY = bitmapHeight / imageRectDisplay.height()
 
-        val srcLeft = ((crop.rect.left - imageRectDisplay.left) * scaleX).toInt()
-        val srcTop = ((crop.rect.top - imageRectDisplay.top) * scaleY).toInt()
-        val srcRight = ((crop.rect.right - imageRectDisplay.left) * scaleX).toInt()
-        val srcBottom = ((crop.rect.bottom - imageRectDisplay.top) * scaleY).toInt()
+        val padPx = 12
+        val srcLeft = (((crop.rect.left - imageRectDisplay.left) * scaleX).toInt() - padPx).coerceIn(0, bitmapWidth - 1)
+        val srcTop = (((crop.rect.top - imageRectDisplay.top) * scaleY).toInt() - padPx).coerceIn(0, bitmapHeight - 1)
+        val srcRight = (((crop.rect.right - imageRectDisplay.left) * scaleX).toInt() + padPx).coerceIn(srcLeft + 1, bitmapWidth)
+        val srcBottom = (((crop.rect.bottom - imageRectDisplay.top) * scaleY).toInt() + padPx).coerceIn(srcTop + 1, bitmapHeight)
+        val srcW = srcRight - srcLeft
+        val srcH = srcBottom - srcTop
+        if (srcW < 16 || srcH < 16) return
 
-        val insideTokens = all.filter { token ->
+        // Full-screen tokens inside the frame, kept for fallback and for
+        // approximating the selection index range used by the pin handles.
+        val insideTokens = _uiState.value.allTokens.filter { token ->
             val box = token.boundingBox
             box.centerX() in srcLeft..srcRight && box.centerY() in srcTop..srcBottom
         }
+        val fallbackStartIdx = insideTokens.minOfOrNull { it.globalIndex } ?: 0
+        val fallbackEndIdx = insideTokens.maxOfOrNull { it.globalIndex } ?: 0
 
-        if (insideTokens.isNotEmpty()) {
-            val minIdx = insideTokens.minOf { it.globalIndex }
-            val maxIdx = insideTokens.maxOf { it.globalIndex }
-            val sel = buildTextSelection(minIdx, maxIdx, imageRectDisplay, bitmapWidth, bitmapHeight)
-            _uiState.update {
-                it.copy(
-                    textSelection = sel,
-                    activeCropSelection = null,
-                    feedbackMessage = "枠内のテキストを抽出しました (${insideTokens.size}要素)"
-                )
+        _uiState.update { it.copy(
+            isOcrRunning = true,
+            feedbackMessage = "枠内を再OCR中..."
+        ) }
+
+        viewModelScope.launch {
+            var cropBmp: Bitmap? = null
+            var ocrInput: Bitmap? = null
+            try {
+                cropBmp = Bitmap.createBitmap(source, srcLeft, srcTop, srcW, srcH)
+
+                // Upscale small crops so characters reach a comfortable pixel size
+                val maxDim = max(srcW, srcH)
+                val upscale = if (maxDim < CROP_OCR_TARGET_MAX_DIM) {
+                    min(CROP_OCR_MAX_UPSCALE, CROP_OCR_TARGET_MAX_DIM.toFloat() / maxDim)
+                } else {
+                    1f
+                }
+                ocrInput = if (upscale > 1f) {
+                    Bitmap.createScaledBitmap(
+                        cropBmp,
+                        (srcW * upscale).toInt().coerceAtLeast(1),
+                        (srcH * upscale).toInt().coerceAtLeast(1),
+                        true
+                    )
+                } else {
+                    cropBmp
+                }
+
+                val items = ocrManager.recognizeText(ocrInput)
+
+                // Map token boxes from OCR-input coordinates back to original bitmap coordinates
+                val mappedTokens = mutableListOf<OcrToken>()
+                var globalIdx = 0
+                for (item in items) {
+                    for (token in item.tokens) {
+                        val b = token.boundingBox
+                        val mappedBox = Rect(
+                            srcLeft + (b.left / upscale).toInt(),
+                            srcTop + (b.top / upscale).toInt(),
+                            srcLeft + (b.right / upscale).toInt(),
+                            srcTop + (b.bottom / upscale).toInt()
+                        )
+                        mappedTokens.add(
+                            token.copy(
+                                id = "crop_${token.id}",
+                                boundingBox = mappedBox,
+                                globalIndex = globalIdx++
+                            )
+                        )
+                    }
+                }
+
+                if (mappedTokens.isNotEmpty()) {
+                    // Index-basis fix: start/end indices now use the SAME
+                    // basis as selectedTokens (the crop-local globalIndex
+                    // assigned above, 0..size-1). The old code mixed in
+                    // full-screen fallback indices, so a later pin drag
+                    // interpreted the range against unrelated tokens.
+                    val dispScaleX = imageRectDisplay.width() / bitmapWidth
+                    val dispScaleY = imageRectDisplay.height() / bitmapHeight
+                    fun toDisplay(box: Rect) = RectF(
+                        imageRectDisplay.left + box.left * dispScaleX,
+                        imageRectDisplay.top + box.top * dispScaleY,
+                        imageRectDisplay.left + box.right * dispScaleX,
+                        imageRectDisplay.top + box.bottom * dispScaleY
+                    )
+                    val startBox = toDisplay(mappedTokens.first().boundingBox)
+                    val endBox = toDisplay(mappedTokens.last().boundingBox)
+
+                    _uiState.update { it.copy(
+                        textSelection = TextSelectionState(
+                            startTokenIndex = mappedTokens.first().globalIndex,
+                            endTokenIndex = mappedTokens.last().globalIndex,
+                            selectedTokens = mappedTokens,
+                            fullText = joinSelectedText(mappedTokens),
+                            startPinPoint = Offset(startBox.left, startBox.top),
+                            endPinPoint = Offset(endBox.right, endBox.bottom)
+                        ),
+                        activeCropSelection = null,
+                        isOcrRunning = false,
+                        feedbackMessage = "枠内テキストを再OCRで抽出しました (${mappedTokens.size}要素)"
+                    ) }
+                } else if (insideTokens.isNotEmpty()) {
+                    // Re-OCR found nothing: fall back to the full-screen tokens in the frame
+                    val sel = buildTextSelection(fallbackStartIdx, fallbackEndIdx, imageRectDisplay, bitmapWidth, bitmapHeight)
+                    _uiState.update { it.copy(
+                        textSelection = sel,
+                        activeCropSelection = null,
+                        isOcrRunning = false,
+                        feedbackMessage = "枠内のテキストを抽出しました (${insideTokens.size}要素)"
+                    ) }
+                } else {
+                    _uiState.update { it.copy(
+                        isOcrRunning = false,
+                        feedbackMessage = "枠内にテキストが見つかりませんでした"
+                    ) }
+                }
+            } catch (e: Throwable) {
+                Log.e("CircleLensVM", "Crop re-OCR failed", e)
+                _uiState.update { it.copy(
+                    isOcrRunning = false,
+                    feedbackMessage = "枠内OCRに失敗しました"
+                ) }
+            } finally {
+                if (ocrInput != null && ocrInput != cropBmp) {
+                    try { ocrInput.recycle() } catch (_: Throwable) {}
+                }
+                if (cropBmp != null && cropBmp != source) {
+                    try { cropBmp.recycle() } catch (_: Throwable) {}
+                }
             }
-        } else {
-            _uiState.update { it.copy(feedbackMessage = "枠内にテキストが見つかりませんでした") }
         }
     }
 
     fun shareEntireScreen(target: ShareTarget? = null) {
         val fullBmp = _uiState.value.currentBitmap
         if (fullBmp == null) {
-            _uiState.update { it.copy(feedbackMessage = "画面キャプチャを準備中です。少々お待ちください...") }
+            _uiState.update { it.copy(
+                feedbackMessage = "画面キャプチャを準備中です。少々お待ちください..."
+            ) }
             return
         }
         viewModelScope.launch {
@@ -686,7 +862,7 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
                 targetPickerIsImage = isImage
             )
         }
-        // Loaded on demand (see init): only the picker lists every share target.
+        // Loaded on demand: only the picker lists every share target.
         if (show) {
             val state = _uiState.value
             val needed = if (isImage) state.availableImageTargets else state.availableTextTargets
@@ -707,6 +883,49 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
 
     fun showAssistHelp(show: Boolean) {
         _uiState.update { it.copy(showAssistHelpSheet = show) }
+    }
+
+    // ---- Translation session (state in ViewModel; see CircleLensUiState) ----
+
+    private val translateController by lazy { TranslateController(getApplication()) }
+
+    fun openTranslate(text: String) {
+        if (text.isBlank()) return
+        val src = TranslateController.detectLang(text)
+        _uiState.update { it.copy(
+            translateSourceText = text,
+            translateResult = null,
+            translateSrcLang = src,
+            translateTgtLang = if (src == "ja") "en" else "ja"
+        ) }
+    }
+
+    fun updateTranslateResult(text: String?) {
+        _uiState.update { it.copy(translateResult = text) }
+    }
+
+    fun swapTranslateLangs() {
+        _uiState.update { st ->
+            st.copy(
+                translateSrcLang = st.translateTgtLang,
+                translateTgtLang = st.translateSrcLang,
+                translateResult = null
+            )
+        }
+    }
+
+    fun closeTranslate() {
+        _uiState.update { it.copy(
+            translateSourceText = null,
+            translateResult = null
+        ) }
+    }
+
+    /** Low-memory eviction: free the ~550MB native model; it reloads on demand. */
+    fun onLowMemory() {
+        viewModelScope.launch {
+            try { translateController.releaseModel() } catch (_: Throwable) {}
+        }
     }
 
     fun dismissFeedback() {
