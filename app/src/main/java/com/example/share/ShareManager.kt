@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
@@ -16,13 +17,17 @@ import android.net.Uri
 import android.os.Build
 import android.util.Log
 import android.widget.Toast
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.content.FileProvider
 import com.example.model.ShareTarget
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -31,7 +36,7 @@ import java.util.UUID
 class ShareManager private constructor(context: Context) {
 
     private val appContext = context.applicationContext
-    private val prefs = appContext.getSharedPreferences("circle_ocr_share_prefs", Context.MODE_PRIVATE)
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private val _lastTextShareTarget = MutableStateFlow<ShareTarget?>(null)
     val lastTextShareTarget: StateFlow<ShareTarget?> = _lastTextShareTarget.asStateFlow()
@@ -46,6 +51,10 @@ class ShareManager private constructor(context: Context) {
     val recentImageShareTargets: StateFlow<List<ShareTarget>> = _recentImageShareTargets.asStateFlow()
 
     // Declared before init: loadPersistedTargets() reads them.
+    /** Serialized writer for the first-frame snapshot (see [quickSnapshot]). */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val snapshotScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+
     private val availableTargetsCache =
         java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<ShareTarget>>>()
 
@@ -57,9 +66,76 @@ class ShareManager private constructor(context: Context) {
         loadPersistedTargets()
     }
 
+    /** Share targets known without touching PackageManager, for the first frame. */
+    data class QuickSnapshot(
+        val lastTextTarget: ShareTarget?,
+        val lastImageTarget: ShareTarget?,
+        val recentTextTargets: List<ShareTarget>,
+        val recentImageTargets: List<ShareTarget>
+    )
+
     companion object {
         private const val AVAILABLE_TARGETS_TTL_MS = 5 * 60 * 1000L
         private const val ICON_MAX_SIZE_DP = 48
+        private const val PREFS_NAME = "circle_ocr_share_prefs"
+
+        // First-frame snapshot of the last text/image targets: the component
+        // (same "pkg;activity" encoding as the history), the label, and the
+        // already downscaled icon as a small PNG in filesDir.
+        private const val SNAPSHOT_ICON_DIR = "share_target_icons"
+        private const val SNAPSHOT_TEXT_KEY = "snapshot_text_target"
+        private const val SNAPSHOT_TEXT_LABEL = "snapshot_text_label"
+        private const val SNAPSHOT_IMAGE_KEY = "snapshot_image_target"
+        private const val SNAPSHOT_IMAGE_LABEL = "snapshot_image_label"
+
+        private fun encodeComponent(target: ShareTarget): String =
+            "${target.packageName};${target.activityName ?: ""}"
+
+        private fun iconFileName(component: String): String =
+            component.replace(Regex("[^A-Za-z0-9._-]"), "_") + ".png"
+
+        /**
+         * The last text/image share targets, available synchronously and cheaply
+         * enough for the first frame: the live values when ShareManager already
+         * exists in this process, otherwise the snapshot saved on disk (two small
+         * PNG decodes). Loading them through PackageManager takes long enough
+         * that the share button used to appear a beat after the screen.
+         */
+        fun quickSnapshot(context: Context): QuickSnapshot {
+            instance?.let { sm ->
+                return QuickSnapshot(
+                    sm._lastTextShareTarget.value,
+                    sm._lastImageShareTarget.value,
+                    sm._recentTextShareTargets.value,
+                    sm._recentImageShareTargets.value
+                )
+            }
+            return try {
+                val appContext = context.applicationContext
+                val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val dir = File(appContext.filesDir, SNAPSHOT_ICON_DIR)
+                fun read(keyPref: String, labelPref: String): ShareTarget? {
+                    val component = prefs.getString(keyPref, null) ?: return null
+                    val parts = component.split(";")
+                    val pkg = parts[0].takeIf { it.isNotBlank() } ?: return null
+                    val activity = parts.getOrNull(1)?.takeIf { it.isNotBlank() }
+                    val iconFile = File(dir, iconFileName(component))
+                    val icon = if (iconFile.exists()) BitmapFactory.decodeFile(iconFile.path) else null
+                    return ShareTarget(
+                        packageName = pkg,
+                        activityName = activity,
+                        appName = prefs.getString(labelPref, null) ?: pkg,
+                        iconBitmap = icon?.asImageBitmap()
+                    )
+                }
+                val text = read(SNAPSHOT_TEXT_KEY, SNAPSHOT_TEXT_LABEL)
+                val image = read(SNAPSHOT_IMAGE_KEY, SNAPSHOT_IMAGE_LABEL)
+                QuickSnapshot(text, image, listOfNotNull(text), listOfNotNull(image))
+            } catch (e: Throwable) {
+                Log.w("ShareManager", "Could not read share target snapshot", e)
+                QuickSnapshot(null, null, emptyList(), emptyList())
+            }
+        }
 
         @Volatile
         private var instance: ShareManager? = null
@@ -124,6 +200,8 @@ class ShareManager private constructor(context: Context) {
         }
         _recentImageShareTargets.value = imgTargets
         _lastImageShareTarget.value = imgTargets.firstOrNull()
+
+        persistSnapshot()
     }
 
     /**
@@ -232,6 +310,7 @@ class ShareManager private constructor(context: Context) {
                 .putString("last_img_act", target.activityName)
                 .putString("recent_img_history", serialized)
                 .apply()
+            persistSnapshot()
         } else {
             _lastTextShareTarget.value = target
             val currentList = _recentTextShareTargets.value.toMutableList()
@@ -246,6 +325,46 @@ class ShareManager private constructor(context: Context) {
                 .putString("last_text_act", target.activityName)
                 .putString("recent_text_history", serialized)
                 .apply()
+            persistSnapshot()
+        }
+    }
+
+    /**
+     * Saves the current last text/image targets for [quickSnapshot]. Icons are
+     * rewritten each time (at most twice per process start plus once per
+     * share), so an updated app icon is picked up; files of targets that are
+     * no longer shown are deleted.
+     */
+    private fun persistSnapshot() {
+        val text = _lastTextShareTarget.value
+        val image = _lastImageShareTarget.value
+        snapshotScope.launch {
+            try {
+                val dir = File(appContext.filesDir, SNAPSHOT_ICON_DIR).apply { mkdirs() }
+                val keep = HashSet<String>()
+                val editor = prefs.edit()
+                for ((target, keyPref, labelPref) in listOf(
+                    Triple(text, SNAPSHOT_TEXT_KEY, SNAPSHOT_TEXT_LABEL),
+                    Triple(image, SNAPSHOT_IMAGE_KEY, SNAPSHOT_IMAGE_LABEL)
+                )) {
+                    if (target == null) {
+                        editor.remove(keyPref).remove(labelPref)
+                        continue
+                    }
+                    val component = encodeComponent(target)
+                    editor.putString(keyPref, component).putString(labelPref, target.appName)
+                    val fileName = iconFileName(component)
+                    keep += fileName
+                    val icon = target.iconBitmap?.asAndroidBitmap() ?: continue
+                    val tmp = File(dir, "$fileName.tmp")
+                    FileOutputStream(tmp).use { out -> icon.compress(Bitmap.CompressFormat.PNG, 100, out) }
+                    if (!tmp.renameTo(File(dir, fileName))) tmp.delete()
+                }
+                editor.apply()
+                dir.listFiles()?.forEach { file -> if (file.name !in keep) file.delete() }
+            } catch (e: Throwable) {
+                Log.w("ShareManager", "Could not save share target snapshot", e)
+            }
         }
     }
 

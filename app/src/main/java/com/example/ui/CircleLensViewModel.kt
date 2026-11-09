@@ -63,7 +63,19 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
     // through PackageManager, which used to block the first frame.
     val shareManager: ShareManager by lazy { ShareManager.getInstance(application) }
 
-    private val _uiState = MutableStateFlow(CircleLensUiState())
+    // The last share targets come from ShareManager's cheap snapshot, so the
+    // direct-share button is laid out in the first frame instead of popping in
+    // once the full ShareManager has loaded in the background.
+    private val _uiState = MutableStateFlow(
+        ShareManager.quickSnapshot(application).let { snapshot ->
+            CircleLensUiState(
+                lastTextShareTarget = snapshot.lastTextTarget,
+                lastImageShareTarget = snapshot.lastImageTarget,
+                recentTextTargets = snapshot.recentTextTargets,
+                recentImageTargets = snapshot.recentImageTargets
+            )
+        }
+    )
     val uiState: StateFlow<CircleLensUiState> = _uiState.asStateFlow()
 
     val closeAppEvent = MutableSharedFlow<Unit>(extraBufferCapacity = 2)
