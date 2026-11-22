@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.max
@@ -64,6 +65,7 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
     val closeAppEvent = MutableSharedFlow<Unit>(extraBufferCapacity = 2)
 
     private var activeLoadJob: Job? = null
+    private var regionRefineJob: Job? = null
     private var isRealBitmapLoaded: Boolean = false
 
     init {
@@ -147,6 +149,7 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
 
     fun loadBitmapDirect(bitmap: Bitmap, message: String? = null) {
         activeLoadJob?.cancel()
+        regionRefineJob?.cancel()
         isRealBitmapLoaded = true
 
         // ⚡ INSTANT RENDERING: Display bitmap immediately in 0ms without waiting for OCR
@@ -283,6 +286,7 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
                     trailPoints = emptyList(),
                     feedbackMessage = "画像を切り抜きました"
                 )
+                refineOcrInRegion(cropFrame, imageRectOnDisplay)
                 return
             }
         }
@@ -461,6 +465,48 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
             val updated = buildTextSelection(currentSel.startTokenIndex, targetIdx, imageRectOnDisplay, bitmapWidth, bitmapHeight)
             if (updated != null) {
                 _uiState.value = _uiState.value.copy(textSelection = updated)
+            }
+        }
+    }
+
+    /**
+     * Re-runs OCR on the circled area at higher resolution and merges the result into the
+     * full-screen OCR, so text selection inside the circle uses the more accurate tokens.
+     */
+    private fun refineOcrInRegion(cropRectDisplay: RectF, imageRectDisplay: RectF) {
+        val bitmap = _uiState.value.currentBitmap ?: return
+        if (imageRectDisplay.width() <= 0 || imageRectDisplay.height() <= 0) return
+
+        val scaleX = bitmap.width / imageRectDisplay.width()
+        val scaleY = bitmap.height / imageRectDisplay.height()
+        val region = Rect(
+            ((cropRectDisplay.left - imageRectDisplay.left) * scaleX).toInt().coerceIn(0, bitmap.width),
+            ((cropRectDisplay.top - imageRectDisplay.top) * scaleY).toInt().coerceIn(0, bitmap.height),
+            ((cropRectDisplay.right - imageRectDisplay.left) * scaleX).toInt().coerceIn(0, bitmap.width),
+            ((cropRectDisplay.bottom - imageRectDisplay.top) * scaleY).toInt().coerceIn(0, bitmap.height)
+        )
+        if (region.width() < 8 || region.height() < 8) return
+
+        regionRefineJob?.cancel()
+        regionRefineJob = viewModelScope.launch {
+            try {
+                val refined = ocrManager.recognizeRegion(bitmap, region)
+                // Wait for the full-screen OCR to finish so the merge has a base to work on.
+                val ready = _uiState.first { !it.isOcrRunning }
+                if (ready.currentBitmap !== bitmap) return@launch
+
+                val merged = ocrManager.mergeRegionResults(ready.ocrItems, region, refined)
+                if (merged === ready.ocrItems) return@launch
+                _uiState.value = _uiState.value.copy(
+                    ocrItems = merged,
+                    allTokens = merged.flatMap { it.tokens },
+                    // Token indices changed; drop any stale selection.
+                    textSelection = null
+                )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.w("CircleLensVM", "Region re-OCR failed", e)
             }
         }
     }

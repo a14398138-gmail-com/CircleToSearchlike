@@ -23,6 +23,16 @@ import kotlin.math.min
 
 class OcrManager {
 
+    private companion object {
+        /** Long-side cap for inference. Native phone screenshots (<= 2400px typ.) are not downscaled. */
+        const val MAX_INFERENCE_DIM = 2560f
+        /** Upscale factor for re-recognizing a circled region; helps small text. */
+        const val REGION_UPSCALE = 2f
+        const val REGION_PADDING_PX = 12
+        const val JAPANESE_TIMEOUT_MS = 4000L
+        const val LATIN_TIMEOUT_MS = 2500L
+    }
+
     private val japaneseRecognizer by lazy {
         try {
             TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build())
@@ -68,20 +78,127 @@ class OcrManager {
     }
 
     /**
-     * Fast, high-accuracy text recognition optimized for mobile screen captures.
+     * Full-screen text recognition for mobile screen captures.
      * 1. Safely converts hardware bitmaps if needed.
-     * 2. Auto-scales ultra-high resolution screenshots (e.g. 1440x3120) to optimal inference resolution (max 1080px),
-     *    reducing inference latency to ~150ms without losing character accuracy.
-     * 3. Uses strict timeouts (2.5s) with automatic Latin recognizer fallback to ensure OCR never hangs.
-     * 4. Maps bounding boxes back to the original full bitmap coordinates seamlessly.
+     * 2. Keeps (near-)native resolution: screenshots are only downscaled when the long side
+     *    exceeds [MAX_INFERENCE_DIM]. Downscaling a 1080x2400 capture to 1080px long side
+     *    shrinks body text below the ~24px per character that the Japanese model needs.
+     * 3. Uses timeouts with automatic Latin recognizer fallback to ensure OCR never hangs.
+     * 4. Maps bounding boxes back to the original full bitmap coordinates.
      */
-    suspend fun recognizeText(bitmap: Bitmap): List<OcrTextItem> = withContext(Dispatchers.Default) {
-        val origW = bitmap.width
-        val origH = bitmap.height
-        if (origW <= 0 || origH <= 0) return@withContext emptyList()
+    suspend fun recognizeText(bitmap: Bitmap): List<OcrTextItem> =
+        recognizeScaled(bitmap, preferredScale = 1f, offsetX = 0, offsetY = 0)
 
-        // 1. Ensure bitmap is software-accessible (in case system delivers HARDWARE bitmap)
-        val safeBitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && bitmap.config == Bitmap.Config.HARDWARE) {
+    /**
+     * High-accuracy re-recognition of a sub-region (e.g. the area the user circled).
+     * The region is cropped from [source], upscaled by [REGION_UPSCALE] (capped so the long side
+     * stays within [MAX_INFERENCE_DIM]) and recognized. Returned boxes are in [source] coordinates.
+     */
+    suspend fun recognizeRegion(source: Bitmap, region: Rect): List<OcrTextItem> = withContext(Dispatchers.Default) {
+        val safeSource = toSoftwareBitmap(source)
+        val left = (region.left - REGION_PADDING_PX).coerceIn(0, safeSource.width - 1)
+        val top = (region.top - REGION_PADDING_PX).coerceIn(0, safeSource.height - 1)
+        val right = (region.right + REGION_PADDING_PX).coerceIn(left + 1, safeSource.width)
+        val bottom = (region.bottom + REGION_PADDING_PX).coerceIn(top + 1, safeSource.height)
+        val w = right - left
+        val h = bottom - top
+        if (w < 8 || h < 8) {
+            if (safeSource != source) safeSource.recycle()
+            return@withContext emptyList()
+        }
+
+        val crop = try {
+            Bitmap.createBitmap(safeSource, left, top, w, h)
+        } catch (e: Throwable) {
+            Log.w("OcrManager", "Failed to crop region for re-OCR", e)
+            if (safeSource != source) safeSource.recycle()
+            return@withContext emptyList()
+        }
+
+        try {
+            recognizeScaled(crop, preferredScale = REGION_UPSCALE, offsetX = left, offsetY = top)
+        } finally {
+            if (crop != safeSource) {
+                try { crop.recycle() } catch (_: Throwable) {}
+            }
+            if (safeSource != source) {
+                try { safeSource.recycle() } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    /**
+     * Replaces the lines of [full] that lie inside [region] with [refined] (from [recognizeRegion]),
+     * then re-sorts into reading order and re-assigns line/token/global indices so that
+     * gesture selection keeps working on the merged list.
+     * If [refined] is empty the original result is returned unchanged.
+     */
+    fun mergeRegionResults(
+        full: List<OcrTextItem>,
+        region: Rect,
+        refined: List<OcrTextItem>
+    ): List<OcrTextItem> {
+        if (refined.isEmpty()) return full
+
+        val kept = full.filter { item ->
+            val b = item.boundingBox
+            !region.contains(b.centerX(), b.centerY())
+        }
+        // Refined lines found only in the padding, or duplicating a kept line that straddles
+        // the region edge, are dropped to avoid double text.
+        val refinedInside = refined.filter { item ->
+            val b = item.boundingBox
+            region.contains(b.centerX(), b.centerY()) &&
+                kept.none { overlapRatio(it.boundingBox, b) > 0.5f }
+        }
+        if (refinedInside.isEmpty()) return full
+        val merged = sortItemsInReadingOrder(kept + refinedInside)
+
+        var global = 0
+        return merged.mapIndexed { lineIdx, item ->
+            val tokens = item.tokens.mapIndexed { tokIdx, t ->
+                t.copy(
+                    id = "t_${lineIdx}_${tokIdx}",
+                    lineIndex = lineIdx,
+                    tokenIndex = tokIdx,
+                    globalIndex = global++
+                )
+            }
+            item.copy(id = "line_${lineIdx}", lineIndex = lineIdx, tokens = tokens)
+        }
+    }
+
+    private fun overlapRatio(a: Rect, b: Rect): Float {
+        val ix = max(0, min(a.right, b.right) - max(a.left, b.left))
+        val iy = max(0, min(a.bottom, b.bottom) - max(a.top, b.top))
+        val smaller = min(a.width() * a.height(), b.width() * b.height()).coerceAtLeast(1)
+        return (ix.toLong() * iy).toFloat() / smaller
+    }
+
+    /** Row clustering identical in spirit to [sortLinesInReadingOrder], on already-mapped items. */
+    private fun sortItemsInReadingOrder(items: List<OcrTextItem>): List<OcrTextItem> {
+        if (items.size <= 1) return items
+        val rows = mutableListOf<MutableList<OcrTextItem>>()
+        for (item in items.sortedWith(compareBy<OcrTextItem> { it.boundingBox.top }.thenBy { it.boundingBox.left })) {
+            val box = item.boundingBox
+            val height = box.height().coerceAtLeast(1)
+            val centerY = box.centerY()
+            val row = rows.firstOrNull { r ->
+                val rTop = r.minOf { it.boundingBox.top }
+                val rBottom = r.maxOf { it.boundingBox.bottom }
+                val rHeight = (rBottom - rTop).coerceAtLeast(1)
+                val overlap = max(0, min(box.bottom, rBottom) - max(box.top, rTop))
+                overlap.toFloat() / min(height, rHeight) >= 0.40f || centerY in rTop..rBottom
+            }
+            if (row != null) row.add(item) else rows.add(mutableListOf(item))
+        }
+        rows.sortBy { r -> r.sumOf { it.boundingBox.top } / r.size }
+        rows.forEach { r -> r.sortBy { it.boundingBox.left } }
+        return rows.flatten()
+    }
+
+    private fun toSoftwareBitmap(bitmap: Bitmap): Bitmap =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && bitmap.config == Bitmap.Config.HARDWARE) {
             try {
                 bitmap.copy(Bitmap.Config.ARGB_8888, false) ?: bitmap
             } catch (e: Throwable) {
@@ -92,57 +209,62 @@ class OcrManager {
             bitmap
         }
 
-        val maxDim = max(origW, origH)
-        val targetMaxDim = 1080f
+    /**
+     * Scales [bitmap] by [preferredScale] (reduced if needed so the long side fits
+     * [MAX_INFERENCE_DIM]), runs OCR and maps boxes back via scale + offset.
+     */
+    private suspend fun recognizeScaled(
+        bitmap: Bitmap,
+        preferredScale: Float,
+        offsetX: Int,
+        offsetY: Int
+    ): List<OcrTextItem> = withContext(Dispatchers.Default) {
+        val origW = bitmap.width
+        val origH = bitmap.height
+        if (origW <= 0 || origH <= 0) return@withContext emptyList()
 
-        // Compute optimal inference scaling
-        val (inferenceBitmap, scaleRatio, isScaled) = if (maxDim > targetMaxDim) {
-            val ratio = targetMaxDim / maxDim
-            val targetW = (origW * ratio).toInt().coerceAtLeast(1)
-            val targetH = (origH * ratio).toInt().coerceAtLeast(1)
-            val scaled = try {
+        val safeBitmap = toSoftwareBitmap(bitmap)
+
+        val maxDim = max(origW, origH)
+        val scaleRatio = min(preferredScale, MAX_INFERENCE_DIM / maxDim)
+        val needsScale = kotlin.math.abs(scaleRatio - 1f) > 0.01f
+
+        val inferenceBitmap = if (needsScale) {
+            val targetW = (origW * scaleRatio).toInt().coerceAtLeast(1)
+            val targetH = (origH * scaleRatio).toInt().coerceAtLeast(1)
+            try {
                 Bitmap.createScaledBitmap(safeBitmap, targetW, targetH, true)
             } catch (e: Throwable) {
                 safeBitmap
             }
-            Triple(scaled, ratio, scaled != safeBitmap)
         } else {
-            Triple(safeBitmap, 1f, false)
+            safeBitmap
         }
-
-        val inputImage = try {
-            InputImage.fromBitmap(inferenceBitmap, 0)
-        } catch (e: Throwable) {
-            Log.e("OcrManager", "Failed to create InputImage from bitmap", e)
-            if (isScaled && inferenceBitmap != bitmap && inferenceBitmap != safeBitmap) {
-                try { inferenceBitmap.recycle() } catch (_: Throwable) {}
-            }
-            if (safeBitmap != bitmap) {
-                try { safeBitmap.recycle() } catch (_: Throwable) {}
-            }
-            return@withContext emptyList()
-        }
+        val effectiveScale = if (inferenceBitmap == safeBitmap) 1f else scaleRatio
 
         try {
-            // Attempt Japanese recognizer with a strict 2.5-second timeout
-            val japaneseResult = withTimeoutOrNull(2500L) {
-                runMlKitRecognition(japaneseRecognizer, inputImage, scaleRatio)
+            val inputImage = try {
+                InputImage.fromBitmap(inferenceBitmap, 0)
+            } catch (e: Throwable) {
+                Log.e("OcrManager", "Failed to create InputImage from bitmap", e)
+                return@withContext emptyList()
             }
 
+            val japaneseResult = withTimeoutOrNull(JAPANESE_TIMEOUT_MS) {
+                runMlKitRecognition(japaneseRecognizer, inputImage, effectiveScale, offsetX, offsetY)
+            }
             if (japaneseResult != null && japaneseResult.isNotEmpty()) {
                 return@withContext japaneseResult
             }
 
             Log.w("OcrManager", "Japanese recognition timed out or returned empty, falling back to Latin recognizer")
 
-            // Fallback to Latin recognizer with a 1.5-second timeout
-            val latinResult = withTimeoutOrNull(1500L) {
-                runMlKitRecognition(latinRecognizer, inputImage, scaleRatio)
+            val latinResult = withTimeoutOrNull(LATIN_TIMEOUT_MS) {
+                runMlKitRecognition(latinRecognizer, inputImage, effectiveScale, offsetX, offsetY)
             }
-
             latinResult ?: emptyList()
         } finally {
-            if (isScaled && inferenceBitmap != bitmap && inferenceBitmap != safeBitmap) {
+            if (inferenceBitmap != safeBitmap && inferenceBitmap != bitmap) {
                 try { inferenceBitmap.recycle() } catch (_: Throwable) {}
             }
             if (safeBitmap != bitmap) {
@@ -154,13 +276,15 @@ class OcrManager {
     private suspend fun runMlKitRecognition(
         recognizer: com.google.mlkit.vision.text.TextRecognizer,
         inputImage: InputImage,
-        scaleRatio: Float
+        scaleRatio: Float,
+        offsetX: Int = 0,
+        offsetY: Int = 0
     ): List<OcrTextItem> = suspendCancellableCoroutine { continuation ->
         recognizer.process(inputImage)
             .addOnSuccessListener { visionText ->
                 if (continuation.isActive) {
                     try {
-                        val result = processVisionText(visionText, scaleRatio)
+                        val result = processVisionText(visionText, scaleRatio, offsetX, offsetY)
                         continuation.resume(result)
                     } catch (e: Throwable) {
                         Log.e("OcrManager", "Error parsing OCR vision text", e)
@@ -176,7 +300,7 @@ class OcrManager {
             }
     }
 
-    private fun processVisionText(visionText: Text, scaleRatio: Float): List<OcrTextItem> {
+    private fun processVisionText(visionText: Text, scaleRatio: Float, offsetX: Int, offsetY: Int): List<OcrTextItem> {
         val items = mutableListOf<OcrTextItem>()
         var globalTokenIdx = 0
         var globalLineIdx = 0
@@ -192,7 +316,7 @@ class OcrManager {
 
         for (line in sortedLines) {
             val rawLineBox = line.boundingBox ?: Rect(0, 0, 100, 50)
-            val lineBox = unscaleRect(rawLineBox, invScale)
+            val lineBox = unscaleRect(rawLineBox, invScale, offsetX, offsetY)
             val currentLineIdx = globalLineIdx++
             val tokens = mutableListOf<OcrToken>()
             var tokenInLineIdx = 0
@@ -201,7 +325,7 @@ class OcrManager {
             if (elements.isNotEmpty()) {
                 for (element in elements) {
                     val rawElemBox = element.boundingBox ?: rawLineBox
-                    val elementBox = unscaleRect(rawElemBox, invScale)
+                    val elementBox = unscaleRect(rawElemBox, invScale, offsetX, offsetY)
                     val elementText = element.text
                     val symbols = try {
                         element.symbols.sortedBy { it.boundingBox?.left ?: 0 }
@@ -213,7 +337,7 @@ class OcrManager {
                         // Use ML Kit direct Symbol bounding boxes for highest character precision
                         for (symbol in symbols) {
                             val rawSymBox = symbol.boundingBox ?: rawElemBox
-                            val symBox = unscaleRect(rawSymBox, invScale)
+                            val symBox = unscaleRect(rawSymBox, invScale, offsetX, offsetY)
                             val symText = symbol.text
                             tokens.add(
                                 OcrToken(
@@ -333,13 +457,13 @@ class OcrManager {
         return items
     }
 
-    private fun unscaleRect(rect: Rect, invScale: Float): Rect {
-        if (invScale == 1f) return rect
+    private fun unscaleRect(rect: Rect, invScale: Float, offsetX: Int = 0, offsetY: Int = 0): Rect {
+        if (invScale == 1f && offsetX == 0 && offsetY == 0) return rect
         return Rect(
-            (rect.left * invScale).toInt(),
-            (rect.top * invScale).toInt(),
-            (rect.right * invScale).toInt(),
-            (rect.bottom * invScale).toInt()
+            (rect.left * invScale).toInt() + offsetX,
+            (rect.top * invScale).toInt() + offsetY,
+            (rect.right * invScale).toInt() + offsetX,
+            (rect.bottom * invScale).toInt() + offsetY
         )
     }
 
