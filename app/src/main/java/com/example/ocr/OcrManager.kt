@@ -359,7 +359,8 @@ class OcrManager {
             }
     }
 
-    private fun processVisionText(visionText: Text, yOffset: Int = 0): List<OcrTextItem> {
+    @androidx.annotation.VisibleForTesting
+    internal fun processVisionText(visionText: Text, yOffset: Int = 0): List<OcrTextItem> {
         val items = mutableListOf<OcrTextItem>()
         var globalTokenIdx = 0
         var globalLineIdx = 0
