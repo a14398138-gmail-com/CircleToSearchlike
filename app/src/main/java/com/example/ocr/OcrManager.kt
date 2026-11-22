@@ -359,12 +359,25 @@ class OcrManager {
             }
     }
 
-    @androidx.annotation.VisibleForTesting
-    internal fun processVisionText(visionText: Text, yOffset: Int = 0): List<OcrTextItem> {
-        val items = mutableListOf<OcrTextItem>()
-        var globalTokenIdx = 0
-        var globalLineIdx = 0
+    /** Plain snapshot of ML Kit's line/element/symbol tree, so token building is testable without ML Kit. */
+    internal data class RawSymbol(val text: String, val box: Rect?)
+    internal data class RawElement(val text: String, val box: Rect?, val symbols: List<RawSymbol>)
+    internal data class RawLine(val text: String, val box: Rect?, val elements: List<RawElement>)
 
+    private fun Text.Line.toRaw(): RawLine = RawLine(
+        text = text,
+        box = boundingBox,
+        elements = elements.map { element ->
+            val symbols = try {
+                element.symbols.map { RawSymbol(it.text, it.boundingBox) }
+            } catch (e: Throwable) {
+                emptyList()
+            }
+            RawElement(element.text, element.boundingBox, symbols)
+        }
+    )
+
+    private fun processVisionText(visionText: Text, yOffset: Int = 0): List<OcrTextItem> {
         // 1. Gather all non-empty lines from all text blocks
         val rawLines = visionText.textBlocks.flatMap { it.lines }
             .filter { it.text.isNotBlank() }
@@ -372,8 +385,18 @@ class OcrManager {
         // 2. Sort all lines strictly into top-to-bottom reading order
         val sortedLines = sortLinesInReadingOrder(rawLines)
 
-        for (line in sortedLines) {
-            val rawLineBox = line.boundingBox ?: Rect(0, 0, 100, 50)
+        return buildItemsFromLines(sortedLines.map { it.toRaw() }, yOffset)
+    }
+
+    /** Turns lines (already in reading order) into items with per-character / per-word tokens. */
+    @androidx.annotation.VisibleForTesting
+    internal fun buildItemsFromLines(lines: List<RawLine>, yOffset: Int = 0): List<OcrTextItem> {
+        val items = mutableListOf<OcrTextItem>()
+        var globalTokenIdx = 0
+        var globalLineIdx = 0
+
+        for (line in lines) {
+            val rawLineBox = line.box ?: Rect(0, 0, 100, 50)
             val lineBox = offsetRect(rawLineBox, yOffset)
             val currentLineIdx = globalLineIdx++
             val tokens = mutableListOf<OcrToken>()
@@ -430,17 +453,13 @@ class OcrManager {
                 }
             }
 
-            val elements = line.elements.sortedBy { it.boundingBox?.left ?: 0 }
+            val elements = line.elements.sortedBy { it.box?.left ?: 0 }
             if (elements.isNotEmpty()) {
                 for (element in elements) {
-                    val rawElemBox = element.boundingBox ?: rawLineBox
+                    val rawElemBox = element.box ?: rawLineBox
                     val elementBox = offsetRect(rawElemBox, yOffset)
                     val elementText = element.text
-                    val symbols = try {
-                        element.symbols.sortedBy { it.boundingBox?.left ?: 0 }
-                    } catch (e: Throwable) {
-                        emptyList<Text.Symbol>()
-                    }
+                    val symbols = element.symbols.sortedBy { it.box?.left ?: 0 }
 
                     // Symbols occasionally omit characters that element.text contains
                     // (seen on outlined TV captions). Only trust them when they add up.
@@ -453,7 +472,7 @@ class OcrManager {
                     if (symbolsComplete && containsJapanese(elementText)) {
                         // Use ML Kit direct Symbol bounding boxes for highest character precision
                         for (symbol in symbols) {
-                            val rawSymBox = symbol.boundingBox ?: rawElemBox
+                            val rawSymBox = symbol.box ?: rawElemBox
                             val symBox = offsetRect(rawSymBox, yOffset)
                             val symText = symbol.text
                             tokens.add(

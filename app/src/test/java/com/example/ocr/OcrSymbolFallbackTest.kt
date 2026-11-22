@@ -1,9 +1,10 @@
 package com.example.ocr
 
 import android.graphics.Rect
-import com.google.mlkit.vision.text.Text
-import io.mockk.every
-import io.mockk.mockk
+import com.example.model.OcrTextItem
+import com.example.ocr.OcrManager.RawElement
+import com.example.ocr.OcrManager.RawLine
+import com.example.ocr.OcrManager.RawSymbol
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -11,51 +12,35 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 /**
- * ML Kit's Text objects are mocked so we can reproduce the case seen on outlined TV captions:
- * the recognizer's line/element text is complete but the per-character symbols miss some characters.
+ * Reproduces the case seen on outlined TV captions: ML Kit's line/element text is complete
+ * but the per-character symbols (or elements) miss some characters.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
 class OcrSymbolFallbackTest {
 
-    private fun symbol(text: String, left: Int): Text.Symbol = mockk {
-        every { this@mockk.text } returns text
-        every { boundingBox } returns Rect(left, 0, left + 40, 40)
-    }
+    private fun box(left: Int, chars: Int = 1) = Rect(left, 0, left + 40 * chars, 40)
+    private fun sym(text: String, left: Int) = RawSymbol(text, box(left))
+    private fun elem(text: String, left: Int, symbols: List<RawSymbol>) = RawElement(text, box(left, text.length), symbols)
+    private fun line(text: String, vararg elements: RawElement) = RawLine(text, box(0, text.length), elements.toList())
 
-    private fun element(text: String, left: Int, symbols: List<Text.Symbol>): Text.Element = mockk {
-        every { this@mockk.text } returns text
-        every { boundingBox } returns Rect(left, 0, left + 40 * text.length, 40)
-        every { this@mockk.symbols } returns symbols
-    }
-
-    private fun visionText(lineText: String, elements: List<Text.Element>): Text {
-        val line = mockk<Text.Line> {
-            every { text } returns lineText
-            every { boundingBox } returns Rect(0, 0, 40 * lineText.length, 40)
-            every { this@mockk.elements } returns elements
-        }
-        val block = mockk<Text.TextBlock> { every { lines } returns listOf(line) }
-        return mockk { every { textBlocks } returns listOf(block) }
-    }
-
-    private fun tokensText(items: List<com.example.model.OcrTextItem>) =
-        items.flatMap { it.tokens }.joinToString("") { it.text }
+    private fun build(vararg lines: RawLine) = OcrManager().buildItemsFromLines(lines.toList())
+    private fun tokensText(items: List<OcrTextItem>) = items.flatMap { it.tokens }.joinToString("") { it.text }
 
     @Test
     fun `complete symbols are used as-is with their own boxes`() {
-        val syms = "あいうえお".mapIndexed { i, c -> symbol(c.toString(), i * 40) }
-        val items = OcrManager().processVisionText(visionText("あいうえお", listOf(element("あいうえお", 0, syms))))
+        val syms = "あいうえお".mapIndexed { i, c -> sym(c.toString(), i * 40) }
+        val items = build(line("あいうえお", elem("あいうえお", 0, syms)))
 
         assertEquals("あいうえお", tokensText(items))
-        assertEquals(syms.map { it.boundingBox }, items.single().tokens.map { it.boundingBox })
+        assertEquals(syms.map { it.box }, items.single().tokens.map { it.boundingBox })
     }
 
     @Test
     fun `symbols missing characters fall back to element text`() {
         // Symbols drop the kanji and one kana that element.text contains.
-        val syms = listOf(symbol("あ", 0), symbol("い", 40), symbol("え", 120))
-        val items = OcrManager().processVisionText(visionText("あ漢いうえ", listOf(element("あ漢いうえ", 0, syms))))
+        val syms = listOf(sym("あ", 0), sym("い", 80), sym("え", 160))
+        val items = build(line("あ漢いうえ", elem("あ漢いうえ", 0, syms)))
 
         assertEquals("あ漢いうえ", tokensText(items))
         assertEquals(5, items.single().tokens.size)
@@ -63,9 +48,9 @@ class OcrSymbolFallbackTest {
 
     @Test
     fun `elements missing characters fall back to line text`() {
-        val e1 = element("あい", 0, listOf(symbol("あ", 0), symbol("い", 40)))
-        val e2 = element("えお", 160, listOf(symbol("え", 160), symbol("お", 200)))
-        val items = OcrManager().processVisionText(visionText("あい漢えお", listOf(e1, e2)))
+        val e1 = elem("あい", 0, listOf(sym("あ", 0), sym("い", 40)))
+        val e2 = elem("えお", 120, listOf(sym("え", 120), sym("お", 160)))
+        val items = build(line("あい漢えお", e1, e2))
 
         assertEquals("あい漢えお", tokensText(items))
         // Indices stay contiguous after the rebuild.
@@ -73,12 +58,21 @@ class OcrSymbolFallbackTest {
     }
 
     @Test
+    fun `global indices stay contiguous across a rebuilt line`() {
+        val ok = line("かき", elem("かき", 0, listOf(sym("か", 0), sym("き", 40))))
+        val broken = line("あ漢い", elem("あ漢い", 0, listOf(sym("あ", 0), sym("い", 80))))
+        val after = line("さし", elem("さし", 0, listOf(sym("さ", 0), sym("し", 40))))
+        val items = build(ok, broken, after)
+
+        assertEquals("かきあ漢いさし", tokensText(items))
+        assertEquals((0 until 7).toList(), items.flatMap { it.tokens }.map { it.globalIndex })
+    }
+
+    @Test
     fun `latin words with spaces are not treated as a mismatch`() {
-        val e1 = element("Hello", 0, emptyList())
-        val e2 = element("World", 240, emptyList())
-        val items = OcrManager().processVisionText(visionText("Hello World", listOf(e1, e2)))
+        val items = build(line("Hello World", elem("Hello", 0, emptyList()), elem("World", 240, emptyList())))
 
         assertEquals(listOf("Hello", "World"), items.single().tokens.map { it.text })
-        assertEquals(Rect(0, 0, 200, 40), items.single().tokens.first().boundingBox)
+        assertEquals(box(0, 5), items.single().tokens.first().boundingBox)
     }
 }
