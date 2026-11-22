@@ -378,6 +378,57 @@ class OcrManager {
             val tokens = mutableListOf<OcrToken>()
             var tokenInLineIdx = 0
 
+            // Builds tokens from the line's full text with evenly split boxes.
+            fun appendLineTextTokens() {
+                val lineText = line.text
+                if (containsJapanese(lineText)) {
+                    val charCount = lineText.length
+                    val lineW = lineBox.width()
+                    for (i in 0 until charCount) {
+                        val ch = lineText[i].toString()
+                        val left = lineBox.left + (lineW * i / charCount)
+                        val right = lineBox.left + (lineW * (i + 1) / charCount)
+                        val charBox = Rect(left, lineBox.top, right, lineBox.bottom)
+                        tokens.add(
+                            OcrToken(
+                                id = "t_${currentLineIdx}_${tokenInLineIdx}",
+                                text = ch,
+                                boundingBox = charBox,
+                                lineIndex = currentLineIdx,
+                                tokenIndex = tokenInLineIdx++,
+                                globalIndex = globalTokenIdx++,
+                                isJapaneseOrCjk = true
+                            )
+                        )
+                    }
+                } else {
+                    val words = lineText.split(WHITESPACE).filter { it.isNotEmpty() }
+                    val totalLen = lineText.length.coerceAtLeast(1)
+                    var currentOffset = 0
+                    for (word in words) {
+                        val startIdx = lineText.indexOf(word, currentOffset).coerceAtLeast(0)
+                        val endIdx = startIdx + word.length
+                        currentOffset = endIdx
+
+                        val left = lineBox.left + (lineBox.width() * startIdx / totalLen)
+                        val right = lineBox.left + (lineBox.width() * endIdx / totalLen)
+                        val wordBox = Rect(left, lineBox.top, right, lineBox.bottom)
+
+                        tokens.add(
+                            OcrToken(
+                                id = "t_${currentLineIdx}_${tokenInLineIdx}",
+                                text = word,
+                                boundingBox = wordBox,
+                                lineIndex = currentLineIdx,
+                                tokenIndex = tokenInLineIdx++,
+                                globalIndex = globalTokenIdx++,
+                                isJapaneseOrCjk = false
+                            )
+                        )
+                    }
+                }
+            }
+
             val elements = line.elements.sortedBy { it.boundingBox?.left ?: 0 }
             if (elements.isNotEmpty()) {
                 for (element in elements) {
@@ -390,7 +441,15 @@ class OcrManager {
                         emptyList<Text.Symbol>()
                     }
 
-                    if (symbols.isNotEmpty() && containsJapanese(elementText)) {
+                    // Symbols occasionally omit characters that element.text contains
+                    // (seen on outlined TV captions). Only trust them when they add up.
+                    val symbolsComplete = symbols.isNotEmpty() &&
+                        normalizeForCompare(symbols.joinToString("") { it.text }) == normalizeForCompare(elementText)
+                    if (symbols.isNotEmpty() && !symbolsComplete) {
+                        Log.d("OcrManager", "Symbol/element mismatch: symbols='${symbols.joinToString("") { it.text }}' element='$elementText'")
+                    }
+
+                    if (symbolsComplete && containsJapanese(elementText)) {
                         // Use ML Kit direct Symbol bounding boxes for highest character precision
                         for (symbol in symbols) {
                             val rawSymBox = symbol.boundingBox ?: rawElemBox
@@ -447,53 +506,23 @@ class OcrManager {
                     }
                 }
             } else {
-                // Direct line text fallback
-                val lineText = line.text
-                if (containsJapanese(lineText)) {
-                    val charCount = lineText.length
-                    val lineW = lineBox.width()
-                    for (i in 0 until charCount) {
-                        val ch = lineText[i].toString()
-                        val left = lineBox.left + (lineW * i / charCount)
-                        val right = lineBox.left + (lineW * (i + 1) / charCount)
-                        val charBox = Rect(left, lineBox.top, right, lineBox.bottom)
-                        tokens.add(
-                            OcrToken(
-                                id = "t_${currentLineIdx}_${tokenInLineIdx}",
-                                text = ch,
-                                boundingBox = charBox,
-                                lineIndex = currentLineIdx,
-                                tokenIndex = tokenInLineIdx++,
-                                globalIndex = globalTokenIdx++,
-                                isJapaneseOrCjk = true
-                            )
-                        )
-                    }
-                } else {
-                    val words = lineText.split(WHITESPACE).filter { it.isNotEmpty() }
-                    val totalLen = lineText.length.coerceAtLeast(1)
-                    var currentOffset = 0
-                    for (word in words) {
-                        val startIdx = lineText.indexOf(word, currentOffset).coerceAtLeast(0)
-                        val endIdx = startIdx + word.length
-                        currentOffset = endIdx
+                appendLineTextTokens()
+            }
 
-                        val left = lineBox.left + (lineBox.width() * startIdx / totalLen)
-                        val right = lineBox.left + (lineBox.width() * endIdx / totalLen)
-                        val wordBox = Rect(left, lineBox.top, right, lineBox.bottom)
-
-                        tokens.add(
-                            OcrToken(
-                                id = "t_${currentLineIdx}_${tokenInLineIdx}",
-                                text = word,
-                                boundingBox = wordBox,
-                                lineIndex = currentLineIdx,
-                                tokenIndex = tokenInLineIdx++,
-                                globalIndex = globalTokenIdx++,
-                                isJapaneseOrCjk = false
-                            )
-                        )
-                    }
+            // Safety net: if element/symbol-based tokens dropped characters compared with
+            // ML Kit's own line text, rebuild the line from line.text so no text is lost.
+            if (elements.isNotEmpty()) {
+                val tokenText = normalizeForCompare(tokens.joinToString("") { it.text })
+                val lineText = normalizeForCompare(line.text)
+                if (tokenText != lineText) {
+                    Log.d(
+                        "OcrManager",
+                        "Token/line text mismatch, rebuilding from line text: tokens='$tokenText' line='$lineText'"
+                    )
+                    globalTokenIdx -= tokens.size
+                    tokenInLineIdx = 0
+                    tokens.clear()
+                    appendLineTextTokens()
                 }
             }
 
@@ -513,6 +542,8 @@ class OcrManager {
         }
         return items
     }
+
+    private fun normalizeForCompare(text: String): String = text.replace(WHITESPACE, "")
 
     private fun offsetRect(rect: Rect, yOffset: Int): Rect {
         if (yOffset == 0) return rect
