@@ -44,6 +44,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.material3.Text
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.Column
 import com.example.model.CropSelection
 import com.example.model.ShareTarget
 import com.example.model.TextSelectionState
@@ -96,6 +101,30 @@ fun TextSelectionPopup(
                 }
             )
 
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            // Preview of the selected text (hidden while the share-history slider is open)
+            val previewText = textSelection?.fullText.orEmpty().trim()
+            if (previewText.isNotEmpty() && !showRecentSlider) {
+                Surface(
+                    modifier = Modifier
+                        .padding(bottom = 6.dp)
+                        .widthIn(max = 300.dp)
+                        .shadow(elevation = 8.dp, shape = RoundedCornerShape(14.dp))
+                        .testTag("selection_preview"),
+                    shape = RoundedCornerShape(14.dp),
+                    color = Color(0xE6FFFFFF)
+                ) {
+                    Text(
+                        text = previewText,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        color = Color(0xFF0F172A),
+                        fontSize = 14.sp,
+                        lineHeight = 19.sp,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
             Surface(
                 modifier = Modifier
                     .shadow(elevation = 14.dp, shape = CircleShape)
@@ -239,6 +268,7 @@ fun TextSelectionPopup(
                         }
                     }
                 }
+            }
             }
         }
     }
