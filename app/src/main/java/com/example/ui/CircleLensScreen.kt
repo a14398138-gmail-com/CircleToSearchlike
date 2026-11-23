@@ -366,11 +366,6 @@ fun CircleLensScreen(
                 isOcrRunning = uiState.isOcrRunning,
                 lastShareTarget = uiState.lastImageShareTarget ?: uiState.lastTextShareTarget,
                 recentTargets = uiState.recentImageTargets,
-                onSelectAllText = {
-                    val bmpW = uiState.currentBitmap?.width ?: 1080
-                    val bmpH = uiState.currentBitmap?.height ?: 2200
-                    viewModel.selectAllText(displayImageRect, bmpW, bmpH)
-                },
                 onShareEntireScreenGeneral = {
                     viewModel.shareEntireScreen(null)
                 },

@@ -15,7 +15,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Screenshot
-import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -45,7 +44,6 @@ fun CircleLensBottomBar(
     isOcrRunning: Boolean = false,
     lastShareTarget: ShareTarget?,
     recentTargets: List<ShareTarget> = emptyList(),
-    onSelectAllText: () -> Unit,
     onShareEntireScreenGeneral: () -> Unit,
     onShareEntireScreenDirect: (ShareTarget) -> Unit,
     onOpenShareSheet: () -> Unit = {}
@@ -96,7 +94,7 @@ fun CircleLensBottomBar(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                // 1. "すべての文字を選択" Icon Button
+                // OCR中だけ小さなインジケーターを出す（全選択ボタンは廃止）
                 if (isOcrRunning) {
                     Box(
                         modifier = Modifier
@@ -109,24 +107,6 @@ fun CircleLensBottomBar(
                             modifier = Modifier.size(18.dp),
                             color = Color(0xFF0F172A),
                             strokeWidth = 2.dp
-                        )
-                    }
-                } else {
-                    IconButton(
-                        onClick = onSelectAllText,
-                        enabled = isReady,
-                        modifier = Modifier
-                            .size(42.dp)
-                            .clip(CircleShape)
-                            .background(Color(0x0F000000))
-                            .alpha(if (isReady) 1f else 0.4f)
-                            .testTag("select_all_text_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.SelectAll,
-                            contentDescription = "すべての文字を選択",
-                            tint = Color(0xFF0F172A),
-                            modifier = Modifier.size(22.dp)
                         )
                     }
                 }
