@@ -360,6 +360,7 @@ fun CircleLensScreen(
             CircleLensBottomBar(
                 modifier = Modifier
                     .align(Alignment.CenterStart)
+                    .offset(y = 72.dp)
                     .padding(start = 10.dp),
                 isReady = uiState.currentBitmap != null,
                 isOcrRunning = uiState.isOcrRunning,
