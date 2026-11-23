@@ -88,10 +88,8 @@ fun CircleLensBottomBar(
             items(recentTargets, key = { "${it.packageName}/${it.activityName}" }) { target ->
                 Box(
                     modifier = Modifier
-                        .size(46.dp)
-                        .shadow(elevation = 2.dp, shape = CircleShape)
-                        .clip(CircleShape)
-                        .background(Color.White)
+                        .size(50.dp)
+                        .clip(RoundedCornerShape(14.dp))
                         .clickable(enabled = isReady) { onShareEntireScreenDirect(target) }
                         .testTag("share_rail_app_${target.packageName}"),
                     contentAlignment = Alignment.Center
@@ -100,9 +98,7 @@ fun CircleLensBottomBar(
                         Image(
                             bitmap = target.iconBitmap,
                             contentDescription = "${target.appName} に画面全体を送る",
-                            modifier = Modifier
-                                .size(40.dp)
-                                .clip(CircleShape)
+                            modifier = Modifier.size(46.dp)
                         )
                     } else {
                         Icon(
