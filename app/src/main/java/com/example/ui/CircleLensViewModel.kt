@@ -19,6 +19,8 @@ import com.example.model.TextSelectionState
 import com.example.model.TextJoiner
 import com.example.model.TrailPoint
 import com.example.ocr.OcrManager
+import com.example.ocr.PaddleRecPostProcess
+import com.example.ocr.ServerTextRecognizer
 import com.example.translate.TranslateController
 import com.example.share.ShareManager
 import com.example.util.CircleLensScreenshotHolder
@@ -72,9 +74,15 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
 
         /** Upper bound for the crop upscale factor. */
         private const val CROP_OCR_MAX_UPSCALE = 2.5f
+        /** Below this mean character confidence, keep ML Kit's reading of the line. */
+        private const val SERVER_REC_MIN_CONFIDENCE = 0.5f
     }
 
     private val ocrManager = OcrManager()
+
+    /** PP-OCRv5 server recognizer used only for the "Tт" (text in frame) action. */
+    private val serverRec = ServerTextRecognizer(application)
+    private var serverRecDownloadJob: Job? = null
     val shareManager = ShareManager.getInstance(application)
 
     // The last share targets come from ShareManager's cheap snapshot, so the
@@ -750,6 +758,105 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     /**
+     * Re-recognizes every ML Kit line in [image] with PP-OCRv5_server_rec.
+     * Line boxes come from ML Kit (its line detection is reliable even when its
+     * character recognition is not); each line is cut out with a little margin and
+     * read by the server model. Lines the server model can't read confidently keep
+     * ML Kit's tokens. Coordinates stay in [image] space.
+     *
+     * Returns the items and how many lines were replaced. Starts the one-time model
+     * download in the background if it's missing.
+     */
+    private suspend fun refineLinesWithServerRec(
+        items: List<OcrTextItem>,
+        image: Bitmap
+    ): Pair<List<OcrTextItem>, Int> {
+        if (items.isEmpty()) return items to 0
+        if (serverRec.state != ServerTextRecognizer.State.READY) {
+            startServerRecDownload()
+            return items to 0
+        }
+
+        var replaced = 0
+        val out = items.map { item ->
+            val box = item.boundingBox
+            val h = box.height().coerceAtLeast(1)
+            val padY = (h * 0.15f).toInt()
+            val padX = (h * 0.3f).toInt()
+            val left = (box.left - padX).coerceIn(0, image.width - 1)
+            val top = (box.top - padY).coerceIn(0, image.height - 1)
+            val right = (box.right + padX).coerceIn(left + 1, image.width)
+            val bottom = (box.bottom + padY).coerceIn(top + 1, image.height)
+
+            val lineBmp = try {
+                Bitmap.createBitmap(image, left, top, right - left, bottom - top)
+            } catch (e: Throwable) {
+                null
+            } ?: return@map item
+
+            val rec = try {
+                serverRec.recognizeLine(lineBmp)
+            } finally {
+                if (lineBmp != image) lineBmp.recycle()
+            }
+            if (rec == null || rec.text.isBlank() || rec.meanConfidence < SERVER_REC_MIN_CONFIDENCE) {
+                return@map item
+            }
+
+            val spans = PaddleRecPostProcess.groupIntoTokens(rec)
+            if (spans.isEmpty()) return@map item
+            Log.d("CircleLensVM", "server_rec line ${item.lineIndex}: mlkit='${item.text}' server='${rec.text}' conf=${rec.meanConfidence}")
+
+            val tokens = spans.mapIndexed { idx, span ->
+                OcrToken(
+                    id = "${item.id}_s$idx",
+                    text = span.text,
+                    boundingBox = Rect(
+                        left + span.left.toInt(),
+                        box.top,
+                        left + span.right.toInt().coerceAtLeast(span.left.toInt() + 1),
+                        box.bottom
+                    ),
+                    lineIndex = item.lineIndex,
+                    tokenIndex = idx,
+                    globalIndex = 0, // reassigned by the caller
+                    isJapaneseOrCjk = span.isCjk
+                )
+            }
+            replaced++
+            item.copy(text = rec.text.trim(), tokens = tokens)
+        }
+        return out to replaced
+    }
+
+    private fun startServerRecDownload() {
+        if (serverRecDownloadJob?.isActive == true) return
+        if (serverRec.state == ServerTextRecognizer.State.READY) return
+        serverRecDownloadJob = viewModelScope.launch {
+            val ok = serverRec.ensureModel()
+            _uiState.update { it.copy(
+                feedbackMessage = if (ok) {
+                    "高精度モデルの準備ができました。もう一度 Tт を押すと使われます"
+                } else {
+                    "高精度モデルのダウンロードに失敗しました"
+                }
+            ) }
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        serverRec.close()
+    }
+
+    private fun serverRecStatusSuffix(base: String): String = when (serverRec.state) {
+        ServerTextRecognizer.State.DOWNLOADING ->
+            "$base\n高精度モデル(約85MB)をダウンロード中 ${(serverRec.downloadProgress * 100).toInt()}%"
+        ServerTextRecognizer.State.FAILED -> "$base\n高精度モデルを利用できません"
+        else -> base
+    }
+
+    /**
      * Re-runs OCR on just the circled region instead of reusing the full-screen
      * result. The crop is cut from the original bitmap, upscaled when small so
      * glyphs get more pixels, and recognized on its own — the region the user
@@ -815,7 +922,9 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
                     cropBmp
                 }
 
-                val items = ocrManager.recognizeText(ocrInput)
+                val mlKitItems = ocrManager.recognizeText(ocrInput)
+                // Re-read each ML Kit line with the server-grade recognizer (if downloaded).
+                val (items, refinedLines) = refineLinesWithServerRec(mlKitItems, ocrInput)
 
                 // Map token boxes from OCR-input coordinates back to original bitmap coordinates
                 val mappedTokens = mutableListOf<OcrToken>()
@@ -867,7 +976,11 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
                         ),
                         activeCropSelection = null,
                         isOcrRunning = false,
-                        feedbackMessage = "枠内テキストを再OCRで抽出しました (${mappedTokens.size}要素)"
+                        feedbackMessage = if (refinedLines > 0) {
+                            "枠内テキストを高精度モデルで抽出しました (${mappedTokens.size}要素)"
+                        } else {
+                            serverRecStatusSuffix("枠内テキストを再OCRで抽出しました (${mappedTokens.size}要素)")
+                        }
                     ) }
                 } else if (insideTokens.isNotEmpty()) {
                     // Re-OCR found nothing: fall back to the full-screen tokens in the frame

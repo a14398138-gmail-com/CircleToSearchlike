@@ -120,6 +120,7 @@ dependencies {
   // implementation(libs.androidx.navigation.compose)
   implementation(libs.mlkit.text.recognition)
   implementation(libs.mlkit.text.recognition.japanese)
+  implementation(libs.onnxruntime.android)
   // Uncomment to use Firestore:
   // implementation(libs.firebase.firestore)
 
