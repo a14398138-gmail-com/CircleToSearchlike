@@ -1,198 +1,136 @@
 package com.example.ui
 
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Screenshot
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.example.model.ShareTarget
 
-@OptIn(ExperimentalFoundationApi::class)
+private val RailShape = RoundedCornerShape(34.dp)
+
+/**
+ * Edge rail on the first screen: the apps the screen was shared to before (newest on top,
+ * scrollable) and a "+" at the end that opens the system share sheet to pick a new app.
+ * Modelled after the OS side panel: pale frosted pill, round app icons.
+ */
 @Composable
 fun CircleLensBottomBar(
     modifier: Modifier = Modifier,
     isReady: Boolean = true,
     isOcrRunning: Boolean = false,
-    lastShareTarget: ShareTarget?,
     recentTargets: List<ShareTarget> = emptyList(),
     onShareEntireScreenGeneral: () -> Unit,
-    onShareEntireScreenDirect: (ShareTarget) -> Unit,
-    onOpenShareSheet: () -> Unit = {}
+    onShareEntireScreenDirect: (ShareTarget) -> Unit
 ) {
-    // State for showing recent apps vertical slider
-    var showRecentSlider by remember { mutableStateOf(false) }
+    val maxRailHeight = (LocalConfiguration.current.screenHeightDp * 0.6f).dp
 
     Box(
-        modifier = modifier,
-        contentAlignment = Alignment.BottomCenter
+        modifier = modifier
+            .width(64.dp)
+            .heightIn(max = maxRailHeight)
+            .shadow(elevation = 14.dp, shape = RailShape)
+            .clip(RailShape)
+            .background(
+                Brush.verticalGradient(
+                    0f to Color(0xF2D9D6D6),
+                    0.5f to Color(0xF7F5F3F8),
+                    1f to Color(0xF2D9D6D6)
+                )
+            )
+            .border(1.dp, Color(0x1F000000), RailShape)
+            .alpha(if (isReady) 1f else 0.5f)
+            .testTag("share_rail")
     ) {
-        // Vertical slider for recent apps (slides up from the recent app button)
-        RecentShareTargetsSlider(
-            modifier = Modifier
-                .padding(bottom = 60.dp)
-                .align(Alignment.BottomEnd),
-            visible = showRecentSlider,
-            recentTargets = recentTargets,
-            isImage = true,
-            onTargetSelected = { target ->
-                showRecentSlider = false
-                onShareEntireScreenDirect(target)
-            },
-            onOpenShareSheet = {
-                showRecentSlider = false
-                onOpenShareSheet()
-            },
-            onDismiss = {
-                showRecentSlider = false
-            }
-        )
-
-        Surface(
-            modifier = Modifier
-                .shadow(elevation = 14.dp, shape = CircleShape)
-                .border(
-                    width = 1.dp,
-                    color = Color(0x33000000),
-                    shape = CircleShape
-                ),
-            shape = CircleShape,
-            color = Color(0xCCFFFFFF),
-            tonalElevation = 8.dp
+        LazyColumn(
+            contentPadding = PaddingValues(vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.width(64.dp)
         ) {
-            Row(
-                modifier = Modifier
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                // OCR中だけ小さなインジケーターを出す（全選択ボタンは廃止）
-                if (isOcrRunning) {
-                    Box(
-                        modifier = Modifier
-                            .size(42.dp)
-                            .clip(CircleShape)
-                            .background(Color(0x0F000000)),
-                        contentAlignment = Alignment.Center
-                    ) {
+            if (isOcrRunning) {
+                item(key = "ocr_progress") {
+                    Box(Modifier.size(46.dp), contentAlignment = Alignment.Center) {
                         CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
+                            modifier = Modifier.size(20.dp),
                             color = Color(0xFF0F172A),
                             strokeWidth = 2.dp
                         )
                     }
                 }
+            }
 
-                // 2. "画面全体を送る" Icon Button
-                IconButton(
-                    onClick = onShareEntireScreenGeneral,
-                    enabled = isReady,
+            items(recentTargets, key = { "${it.packageName}/${it.activityName}" }) { target ->
+                Box(
                     modifier = Modifier
-                        .size(42.dp)
+                        .size(46.dp)
+                        .shadow(elevation = 2.dp, shape = CircleShape)
                         .clip(CircleShape)
-                        .background(Color(0x0F000000))
-                        .alpha(if (isReady) 1f else 0.4f)
-                        .testTag("share_entire_screen_button")
+                        .background(Color.White)
+                        .clickable(enabled = isReady) { onShareEntireScreenDirect(target) }
+                        .testTag("share_rail_app_${target.packageName}"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (target.iconBitmap != null) {
+                        Image(
+                            bitmap = target.iconBitmap,
+                            contentDescription = "${target.appName} に画面全体を送る",
+                            modifier = Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.Send,
+                            contentDescription = "${target.appName} に画面全体を送る",
+                            tint = Color(0xFF0F172A),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+            }
+
+            item(key = "pick_new_app") {
+                Box(
+                    modifier = Modifier
+                        .size(44.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0x2E000000))
+                        .clickable(enabled = isReady) { onShareEntireScreenGeneral() }
+                        .testTag("share_entire_screen_button"),
+                    contentAlignment = Alignment.Center
                 ) {
                     Icon(
-                        imageVector = Icons.Default.Screenshot,
-                        contentDescription = "画面全体を送る",
-                        tint = Color(0xFF0F172A),
-                        modifier = Modifier.size(22.dp)
+                        imageVector = Icons.Default.Add,
+                        contentDescription = "新しいアプリを選んで画面全体を送る",
+                        tint = Color.White,
+                        modifier = Modifier.size(26.dp)
                     )
-                }
-
-                // 3. 前回共有したアプリのアイコン (直接送信 / 上スライド・長押しで履歴スライダー展開)
-                if (lastShareTarget != null) {
-                    var totalDragY by remember { mutableFloatStateOf(0f) }
-
-                    Box(
-                        modifier = Modifier
-                            .size(42.dp)
-                            .clip(CircleShape)
-                            .background(Color(0x0F000000))
-                            .border(1.dp, if (showRecentSlider) Color(0xFF0F172A) else Color(0x1F000000), CircleShape)
-                            .alpha(if (isReady) 1f else 0.4f)
-                            .pointerInput(isReady) {
-                                if (!isReady) return@pointerInput
-                                detectDragGestures(
-                                    onDragStart = { totalDragY = 0f },
-                                    onDragEnd = {
-                                        if (totalDragY < -20f) {
-                                            showRecentSlider = true
-                                        }
-                                        totalDragY = 0f
-                                    },
-                                    onDragCancel = { totalDragY = 0f }
-                                ) { change, dragAmount ->
-                                    change.consume()
-                                    totalDragY += dragAmount.y
-                                    if (totalDragY < -25f) {
-                                        showRecentSlider = true
-                                    }
-                                }
-                            }
-                            .combinedClickable(
-                                enabled = isReady,
-                                onClick = {
-                                    if (showRecentSlider) {
-                                        showRecentSlider = false
-                                    } else {
-                                        onShareEntireScreenDirect(lastShareTarget)
-                                    }
-                                },
-                                onLongClick = {
-                                    showRecentSlider = !showRecentSlider
-                                }
-                            )
-                            .testTag("direct_share_last_app_button"),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        if (lastShareTarget.iconBitmap != null) {
-                            Image(
-                                bitmap = lastShareTarget.iconBitmap,
-                                contentDescription = "${lastShareTarget.appName} に画面全体を送る（上にスライドで履歴表示）",
-                                modifier = Modifier
-                                    .size(26.dp)
-                                    .clip(RoundedCornerShape(6.dp))
-                            )
-                        } else {
-                            Icon(
-                                imageVector = Icons.Default.Screenshot,
-                                contentDescription = "${lastShareTarget.appName} に画面全体を送る（上にスライドで履歴表示）",
-                                tint = Color(0xFF0F172A),
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-                    }
                 }
             }
         }

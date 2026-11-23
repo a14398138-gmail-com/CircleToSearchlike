@@ -356,24 +356,19 @@ fun CircleLensScreen(
                 onClose = { viewModel.closeTranslate() }
             )
         } else {
-            // Minimal Icon-Only Bottom Toolbar (White frosted glass + Black only, no drag handle)
+            // Edge rail: recent share targets (scrollable) + "+" to pick a new app
             CircleLensBottomBar(
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .navigationBarsPadding()
-                    .padding(bottom = 16.dp),
+                    .align(Alignment.CenterStart)
+                    .padding(start = 10.dp),
                 isReady = uiState.currentBitmap != null,
                 isOcrRunning = uiState.isOcrRunning,
-                lastShareTarget = uiState.lastImageShareTarget ?: uiState.lastTextShareTarget,
                 recentTargets = uiState.recentImageTargets,
                 onShareEntireScreenGeneral = {
                     viewModel.shareEntireScreen(null)
                 },
                 onShareEntireScreenDirect = { target ->
                     viewModel.shareEntireScreen(target)
-                },
-                onOpenShareSheet = {
-                    viewModel.shareEntireScreen(null)
                 }
             )
         }
