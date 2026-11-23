@@ -868,8 +868,6 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
      */
     fun ocrInsideCrop(imageRectDisplay: RectF, bitmapWidth: Int, bitmapHeight: Int) {
         val crop = _uiState.value.activeCropSelection ?: return
-        val source = _uiState.value.currentBitmap ?: return
-        if (_uiState.value.isOcrRunning) return
         if (imageRectDisplay.width() <= 0f || imageRectDisplay.height() <= 0f) return
 
         val scaleX = bitmapWidth / imageRectDisplay.width()
@@ -880,6 +878,48 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
         val srcTop = (((crop.rect.top - imageRectDisplay.top) * scaleY).toInt() - padPx).coerceIn(0, bitmapHeight - 1)
         val srcRight = (((crop.rect.right - imageRectDisplay.left) * scaleX).toInt() + padPx).coerceIn(srcLeft + 1, bitmapWidth)
         val srcBottom = (((crop.rect.bottom - imageRectDisplay.top) * scaleY).toInt() + padPx).coerceIn(srcTop + 1, bitmapHeight)
+        reOcrRegion(Rect(srcLeft, srcTop, srcRight, srcBottom), imageRectDisplay, bitmapWidth, bitmapHeight, "枠内")
+    }
+
+    /**
+     * Toolbar "re-OCR" for an existing text selection: re-reads the area covered by the
+     * selected tokens (plus a margin so edge characters are whole) with the same
+     * high-accuracy path as the Tт action, and replaces the selection with the result.
+     */
+    fun reOcrSelection(imageRectDisplay: RectF, bitmapWidth: Int, bitmapHeight: Int) {
+        val selected = _uiState.value.textSelection?.selectedTokens.orEmpty()
+        if (selected.isEmpty()) return
+        if (imageRectDisplay.width() <= 0f || imageRectDisplay.height() <= 0f) return
+
+        val union = Rect(selected.first().boundingBox)
+        selected.forEach { union.union(it.boundingBox) }
+        val lineH = selected.map { it.boundingBox.height() }.sorted()[selected.size / 2].coerceAtLeast(1)
+        val padX = (lineH * 0.6f).toInt()
+        val padY = (lineH * 0.3f).toInt()
+        val region = Rect(
+            (union.left - padX).coerceIn(0, bitmapWidth - 1),
+            (union.top - padY).coerceIn(0, bitmapHeight - 1),
+            0, 0
+        )
+        region.right = (union.right + padX).coerceIn(region.left + 1, bitmapWidth)
+        region.bottom = (union.bottom + padY).coerceIn(region.top + 1, bitmapHeight)
+        reOcrRegion(region, imageRectDisplay, bitmapWidth, bitmapHeight, "選択範囲")
+    }
+
+    /** Shared body of [ocrInsideCrop] / [reOcrSelection]; [src] is in bitmap pixels. */
+    private fun reOcrRegion(
+        src: Rect,
+        imageRectDisplay: RectF,
+        bitmapWidth: Int,
+        bitmapHeight: Int,
+        label: String
+    ) {
+        val source = _uiState.value.currentBitmap ?: return
+        if (_uiState.value.isOcrRunning) return
+        val srcLeft = src.left
+        val srcTop = src.top
+        val srcRight = src.right
+        val srcBottom = src.bottom
         val srcW = srcRight - srcLeft
         val srcH = srcBottom - srcTop
         if (srcW < 16 || srcH < 16) return
@@ -895,7 +935,7 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
 
         _uiState.update { it.copy(
             isOcrRunning = true,
-            feedbackMessage = "枠内を再OCR中..."
+            feedbackMessage = "${label}を再OCR中..."
         ) }
 
         viewModelScope.launch {
@@ -977,9 +1017,9 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
                         activeCropSelection = null,
                         isOcrRunning = false,
                         feedbackMessage = if (refinedLines > 0) {
-                            "枠内テキストを高精度モデルで抽出しました (${mappedTokens.size}要素)"
+                            "${label}のテキストを高精度モデルで抽出しました (${mappedTokens.size}要素)"
                         } else {
-                            serverRecStatusSuffix("枠内テキストを再OCRで抽出しました (${mappedTokens.size}要素)")
+                            serverRecStatusSuffix("${label}のテキストを再OCRで抽出しました (${mappedTokens.size}要素)")
                         }
                     ) }
                 } else if (insideTokens.isNotEmpty()) {
@@ -989,19 +1029,19 @@ class CircleLensViewModel(application: Application) : AndroidViewModel(applicati
                         textSelection = sel,
                         activeCropSelection = null,
                         isOcrRunning = false,
-                        feedbackMessage = "枠内のテキストを抽出しました (${insideTokens.size}要素)"
+                        feedbackMessage = "${label}のテキストを抽出しました (${insideTokens.size}要素)"
                     ) }
                 } else {
                     _uiState.update { it.copy(
                         isOcrRunning = false,
-                        feedbackMessage = "枠内にテキストが見つかりませんでした"
+                        feedbackMessage = "${label}にテキストが見つかりませんでした"
                     ) }
                 }
             } catch (e: Throwable) {
                 Log.e("CircleLensVM", "Crop re-OCR failed", e)
                 _uiState.update { it.copy(
                     isOcrRunning = false,
-                    feedbackMessage = "枠内OCRに失敗しました"
+                    feedbackMessage = "${label}のOCRに失敗しました"
                 ) }
             } finally {
                 if (ocrInput != null && ocrInput != cropBmp) {

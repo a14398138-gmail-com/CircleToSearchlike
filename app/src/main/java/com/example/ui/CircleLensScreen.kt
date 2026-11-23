@@ -242,6 +242,12 @@ fun CircleLensScreen(
                         if (text.isNotBlank()) {
                             viewModel.openTranslate(text)
                         }
+                    },
+                    onReOcr = {
+                        val bmp = uiState.currentBitmap
+                        if (bmp != null) {
+                            viewModel.reOcrSelection(displayImageRect, bmp.width, bmp.height)
+                        }
                     }
                 )
             }

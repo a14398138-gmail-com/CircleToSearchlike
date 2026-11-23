@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.Translate
@@ -61,7 +62,8 @@ fun TextSelectionPopup(
     onShareGeneral: () -> Unit,
     onShareDirect: (ShareTarget) -> Unit,
     onOpenShareSheet: () -> Unit = {},
-    onTranslate: () -> Unit = {}
+    onTranslate: () -> Unit = {},
+    onReOcr: () -> Unit = {}
 ) {
     var showRecentSlider by remember { mutableStateOf(false) }
 
@@ -140,6 +142,23 @@ fun TextSelectionPopup(
                         Icon(
                             imageVector = Icons.Default.Share,
                             contentDescription = "テキストを共有",
+                            tint = Color(0xFF0F172A),
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    // Re-OCR Button: re-read the selected area with the high-accuracy recognizer
+                    IconButton(
+                        onClick = onReOcr,
+                        modifier = Modifier
+                            .size(38.dp)
+                            .clip(CircleShape)
+                            .background(Color(0x0F000000))
+                            .testTag("reocr_text_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = "選択範囲を再OCR",
                             tint = Color(0xFF0F172A),
                             modifier = Modifier.size(20.dp)
                         )
