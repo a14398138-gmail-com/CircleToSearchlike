@@ -1,220 +1,154 @@
 package com.example.ui
 
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Screenshot
-import androidx.compose.material.icons.filled.SelectAll
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.example.model.ShareTarget
 
-@OptIn(ExperimentalFoundationApi::class)
+private val BarShape = RoundedCornerShape(34.dp)
+private val CELL = 50.dp
+private val COL_GAP = 6.dp
+private val BAR_PAD_H = 10.dp
+
+/**
+ * Bottom bar on the first screen: the apps the screen was shared to before (newest on the
+ * left) and a "+" at the right end that opens the system share sheet to pick a new app.
+ *
+ * Only the icons and "+" take touches. The bar itself has no pointer input (and does not
+ * scroll), so drags and taps on its translucent background reach the screenshot behind it.
+ */
 @Composable
 fun CircleLensBottomBar(
     modifier: Modifier = Modifier,
     isReady: Boolean = true,
     isOcrRunning: Boolean = false,
-    lastShareTarget: ShareTarget?,
     recentTargets: List<ShareTarget> = emptyList(),
-    onSelectAllText: () -> Unit,
     onShareEntireScreenGeneral: () -> Unit,
-    onShareEntireScreenDirect: (ShareTarget) -> Unit,
-    onOpenAllTargetsPicker: () -> Unit = {}
+    onShareEntireScreenDirect: (ShareTarget) -> Unit
 ) {
-    // State for showing recent apps vertical slider
-    var showRecentSlider by remember { mutableStateOf(false) }
+    // One row along the bottom. Fit as many apps as the screen width allows (newest on the
+    // left, "+" at the right end); older apps are dropped instead of scrolling.
+    val maxWidthDp = LocalConfiguration.current.screenWidthDp - 32f
+    val cellWidthDp = CELL.value + COL_GAP.value
+    val maxCells = (((maxWidthDp - 2 * BAR_PAD_H.value) + COL_GAP.value) / cellWidthDp).toInt().coerceAtLeast(1)
+    val maxApps = (maxCells - 1).coerceAtLeast(0) // keep one cell for "+"
 
-    Box(
-        modifier = modifier,
-        contentAlignment = Alignment.BottomCenter
-    ) {
-        // Vertical slider for recent apps (slides up from the recent app button)
-        RecentShareTargetsSlider(
+    // The OCR indicator floats just above the bar, outside it, without moving the bar.
+    Box(modifier = modifier) {
+    if (isOcrRunning) {
+        Box(
             modifier = Modifier
-                .padding(bottom = 60.dp)
-                .align(Alignment.BottomEnd),
-            visible = showRecentSlider,
-            recentTargets = recentTargets,
-            isImage = true,
-            onTargetSelected = { target ->
-                showRecentSlider = false
-                onShareEntireScreenDirect(target)
-            },
-            onOpenAllTargetsPicker = {
-                showRecentSlider = false
-                onOpenAllTargetsPicker()
-            },
-            onDismiss = {
-                showRecentSlider = false
-            }
-        )
-
-        Surface(
-            modifier = Modifier
-                .shadow(elevation = 14.dp, shape = CircleShape)
-                .border(
-                    width = 1.dp,
-                    color = Color(0x33000000),
-                    shape = CircleShape
-                ),
-            shape = CircleShape,
-            color = Color(0xCCFFFFFF),
-            tonalElevation = 8.dp
+                .align(Alignment.TopCenter)
+                .offset(y = (-34).dp)
+                .size(26.dp)
+                .clip(CircleShape)
+                .background(Color(0x66F5F3F8)),
+            contentAlignment = Alignment.Center
         ) {
-            Row(
-                modifier = Modifier
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                // 1. "すべての文字を選択" Icon Button
-                if (isOcrRunning) {
-                    Box(
-                        modifier = Modifier
-                            .size(42.dp)
-                            .clip(CircleShape)
-                            .background(Color(0x0F000000)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            color = Color(0xFF0F172A),
-                            strokeWidth = 2.dp
-                        )
-                    }
-                } else {
-                    IconButton(
-                        onClick = onSelectAllText,
-                        enabled = isReady,
-                        modifier = Modifier
-                            .size(42.dp)
-                            .clip(CircleShape)
-                            .background(Color(0x0F000000))
-                            .alpha(if (isReady) 1f else 0.4f)
-                            .testTag("select_all_text_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.SelectAll,
-                            contentDescription = "すべての文字を選択",
-                            tint = Color(0xFF0F172A),
-                            modifier = Modifier.size(22.dp)
-                        )
-                    }
-                }
+            CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                color = Color(0xFF0F172A),
+                strokeWidth = 2.dp
+            )
+        }
+    }
+    Row(
+        modifier = Modifier
+            .clip(BarShape)
+            .background(
+                Brush.horizontalGradient(
+                    0f to Color(0x47D9D6D6),
+                    0.5f to Color(0x66F5F3F8),
+                    1f to Color(0x47D9D6D6)
+                )
+            )
+            .border(1.dp, Color(0x33FFFFFF), BarShape)
+            .padding(horizontal = BAR_PAD_H, vertical = 8.dp)
+            .alpha(if (isReady) 1f else 0.5f)
+            .testTag("share_rail"),
+        horizontalArrangement = Arrangement.spacedBy(COL_GAP),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        recentTargets.take(maxApps).forEach { target ->
+            AppCell(target, isReady) { onShareEntireScreenDirect(target) }
+        }
+        NewAppCell(isReady, onShareEntireScreenGeneral)
+    }
+    }
+}
 
-                // 2. "画面全体を送る" Icon Button
-                IconButton(
-                    onClick = onShareEntireScreenGeneral,
-                    enabled = isReady,
-                    modifier = Modifier
-                        .size(42.dp)
-                        .clip(CircleShape)
-                        .background(Color(0x0F000000))
-                        .alpha(if (isReady) 1f else 0.4f)
-                        .testTag("share_entire_screen_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Screenshot,
-                        contentDescription = "画面全体を送る",
-                        tint = Color(0xFF0F172A),
-                        modifier = Modifier.size(22.dp)
-                    )
-                }
+@Composable
+private fun AppCell(target: ShareTarget, isReady: Boolean, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(CELL)
+            .clip(RoundedCornerShape(14.dp))
+            .clickable(enabled = isReady, onClick = onClick)
+            .testTag("share_rail_app_${target.packageName}"),
+        contentAlignment = Alignment.Center
+    ) {
+        if (target.iconBitmap != null) {
+            Image(
+                bitmap = target.iconBitmap,
+                contentDescription = "${target.appName} に画面全体を送る",
+                modifier = Modifier.size(46.dp)
+            )
+        } else {
+            Icon(
+                imageVector = Icons.Default.Send,
+                contentDescription = "${target.appName} に画面全体を送る",
+                tint = Color(0xFF0F172A),
+                modifier = Modifier.size(20.dp)
+            )
+        }
+    }
+}
 
-                // 3. 前回共有したアプリのアイコン (直接送信 / 上スライド・長押しで履歴スライダー展開)
-                if (lastShareTarget != null) {
-                    var totalDragY by remember { mutableFloatStateOf(0f) }
-
-                    Box(
-                        modifier = Modifier
-                            .size(42.dp)
-                            .clip(CircleShape)
-                            .background(Color(0x0F000000))
-                            .border(1.dp, if (showRecentSlider) Color(0xFF0F172A) else Color(0x1F000000), CircleShape)
-                            .alpha(if (isReady) 1f else 0.4f)
-                            .pointerInput(isReady) {
-                                if (!isReady) return@pointerInput
-                                detectDragGestures(
-                                    onDragStart = { totalDragY = 0f },
-                                    onDragEnd = {
-                                        if (totalDragY < -20f) {
-                                            showRecentSlider = true
-                                        }
-                                        totalDragY = 0f
-                                    },
-                                    onDragCancel = { totalDragY = 0f }
-                                ) { change, dragAmount ->
-                                    change.consume()
-                                    totalDragY += dragAmount.y
-                                    if (totalDragY < -25f) {
-                                        showRecentSlider = true
-                                    }
-                                }
-                            }
-                            .combinedClickable(
-                                enabled = isReady,
-                                onClick = {
-                                    if (showRecentSlider) {
-                                        showRecentSlider = false
-                                    } else {
-                                        onShareEntireScreenDirect(lastShareTarget)
-                                    }
-                                },
-                                onLongClick = {
-                                    showRecentSlider = !showRecentSlider
-                                }
-                            )
-                            .testTag("direct_share_last_app_button"),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        if (lastShareTarget.iconBitmap != null) {
-                            Image(
-                                bitmap = lastShareTarget.iconBitmap,
-                                contentDescription = "${lastShareTarget.appName} に画面全体を送る（上にスライドで履歴表示）",
-                                modifier = Modifier
-                                    .size(26.dp)
-                                    .clip(RoundedCornerShape(6.dp))
-                            )
-                        } else {
-                            Icon(
-                                imageVector = Icons.Default.Screenshot,
-                                contentDescription = "${lastShareTarget.appName} に画面全体を送る（上にスライドで履歴表示）",
-                                tint = Color(0xFF0F172A),
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-                    }
-                }
-            }
+@Composable
+private fun NewAppCell(isReady: Boolean, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier.size(CELL),
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(Color(0x40000000))
+                .clickable(enabled = isReady, onClick = onClick)
+                .testTag("share_entire_screen_button"),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.Add,
+                contentDescription = "新しいアプリを選んで画面全体を送る",
+                tint = Color.White,
+                modifier = Modifier.size(26.dp)
+            )
         }
     }
 }

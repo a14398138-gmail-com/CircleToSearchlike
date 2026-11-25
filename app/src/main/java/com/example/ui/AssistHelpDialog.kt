@@ -56,7 +56,6 @@ fun AssistHelpDialog(
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
-    val hasOverlayPermission = Settings.canDrawOverlays(context)
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -102,7 +101,7 @@ fun AssistHelpDialog(
                         }
                         Spacer(modifier = Modifier.width(10.dp))
                         Text(
-                            text = "アシスタント＆重ねて表示設定",
+                            text = "アシスタント設定",
                             style = MaterialTheme.typography.titleMedium.copy(
                                 color = Color.White,
                                 fontWeight = FontWeight.Bold,
@@ -129,7 +128,7 @@ fun AssistHelpDialog(
                 Spacer(modifier = Modifier.height(12.dp))
 
                 Text(
-                    text = "ホーム長押しやアシスタント操作で、他のアプリの上に重ねて画面OCR・円切り抜きを起動できます。",
+                    text = "ホーム長押しやアシスタント操作で、画面OCR・円切り抜きを起動できます。",
                     style = MaterialTheme.typography.bodyMedium.copy(
                         color = Color(0xFFCBD5E1),
                         fontSize = 13.sp,
@@ -147,50 +146,6 @@ fun AssistHelpDialog(
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
-
-                // Step 2: Overlay permission
-                HelpStepItem(
-                    step = "2",
-                    title = "他のアプリの上に重ねて表示を許可",
-                    desc = if (hasOverlayPermission) "✅ 権限が許可されています" else "他のアプリ起動中にスムーズにオーバーレイ表示するために許可してください。"
-                )
-
-                Spacer(modifier = Modifier.height(14.dp))
-
-                // Overlay Permission Button
-                if (!hasOverlayPermission) {
-                    Button(
-                        onClick = {
-                            openOverlayPermissionSettings(context)
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(44.dp)
-                            .testTag("open_overlay_settings_button"),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Layers,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "他のアプリの上に重ねて表示を許可",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Icon(
-                            imageVector = Icons.Default.OpenInNew,
-                            contentDescription = null,
-                            modifier = Modifier.size(14.dp)
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-                }
 
                 // Button to launch default assist settings
                 Button(
@@ -289,27 +244,6 @@ private fun HelpStepItem(
                     lineHeight = 16.sp
                 )
             )
-        }
-    }
-}
-
-private fun openOverlayPermissionSettings(context: Context) {
-    try {
-        val intent = Intent(
-            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-            Uri.parse("package:${context.packageName}")
-        ).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        context.startActivity(intent)
-    } catch (e: Throwable) {
-        try {
-            val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            context.startActivity(intent)
-        } catch (e2: Throwable) {
-            // Ignored
         }
     }
 }
