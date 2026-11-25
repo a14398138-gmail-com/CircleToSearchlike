@@ -7,8 +7,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -53,11 +55,29 @@ fun CircleLensBottomBar(
     val maxWidthDp = LocalConfiguration.current.screenWidthDp - 32f
     val cellWidthDp = CELL.value + COL_GAP.value
     val maxCells = (((maxWidthDp - 2 * BAR_PAD_H.value) + COL_GAP.value) / cellWidthDp).toInt().coerceAtLeast(1)
-    val reservedForProgress = if (isOcrRunning) 1 else 0
-    val maxApps = (maxCells - reservedForProgress - 1).coerceAtLeast(0) // keep one cell for "+"
+    val maxApps = (maxCells - 1).coerceAtLeast(0) // keep one cell for "+"
 
+    // The OCR indicator floats just above the bar, outside it, without moving the bar.
+    Box(modifier = modifier) {
+    if (isOcrRunning) {
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .offset(y = (-34).dp)
+                .size(26.dp)
+                .clip(CircleShape)
+                .background(Color(0x66F5F3F8)),
+            contentAlignment = Alignment.Center
+        ) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                color = Color(0xFF0F172A),
+                strokeWidth = 2.dp
+            )
+        }
+    }
     Row(
-        modifier = modifier
+        modifier = Modifier
             .clip(BarShape)
             .background(
                 Brush.horizontalGradient(
@@ -73,19 +93,11 @@ fun CircleLensBottomBar(
         horizontalArrangement = Arrangement.spacedBy(COL_GAP),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        if (isOcrRunning) {
-            Box(Modifier.size(CELL), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(20.dp),
-                    color = Color(0xFF0F172A),
-                    strokeWidth = 2.dp
-                )
-            }
-        }
         recentTargets.take(maxApps).forEach { target ->
             AppCell(target, isReady) { onShareEntireScreenDirect(target) }
         }
         NewAppCell(isReady, onShareEntireScreenGeneral)
+    }
     }
 }
 
