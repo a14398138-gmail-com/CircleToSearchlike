@@ -359,9 +359,9 @@ fun CircleLensScreen(
             // Edge rail: recent share targets (scrollable) + "+" to pick a new app
             CircleLensBottomBar(
                 modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .offset(y = 72.dp)
-                    .padding(start = 10.dp),
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 16.dp),
                 isReady = uiState.currentBitmap != null,
                 isOcrRunning = uiState.isOcrRunning,
                 recentTargets = uiState.recentImageTargets,

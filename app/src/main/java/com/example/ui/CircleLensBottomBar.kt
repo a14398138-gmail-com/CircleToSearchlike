@@ -6,12 +6,9 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -30,17 +27,16 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.example.model.ShareTarget
 
-private val RailShape = RoundedCornerShape(34.dp)
+private val BarShape = RoundedCornerShape(34.dp)
 private val CELL = 50.dp
-private val ROW_GAP = 10.dp
-private val COL_GAP = 4.dp
-private const val COLUMNS = 2
+private val COL_GAP = 6.dp
+private val BAR_PAD_H = 10.dp
 
 /**
- * Edge rail on the first screen: the apps the screen was shared to before (newest first,
- * two columns) and a "+" at the end that opens the system share sheet to pick a new app.
+ * Bottom bar on the first screen: the apps the screen was shared to before (newest on the
+ * left) and a "+" at the right end that opens the system share sheet to pick a new app.
  *
- * Only the icons and "+" take touches. The rail itself has no pointer input (and does not
+ * Only the icons and "+" take touches. The bar itself has no pointer input (and does not
  * scroll), so drags and taps on its translucent background reach the screenshot behind it.
  */
 @Composable
@@ -52,32 +48,30 @@ fun CircleLensBottomBar(
     onShareEntireScreenGeneral: () -> Unit,
     onShareEntireScreenDirect: (ShareTarget) -> Unit
 ) {
-    // Fit as many rows as the old max height allowed (60% of the screen, minus one row);
-    // older apps beyond that are dropped instead of scrolling.
-    val maxHeightDp = LocalConfiguration.current.screenHeightDp * 0.6f - 60f
-    val rowHeightDp = CELL.value + ROW_GAP.value
-    val maxRows = (((maxHeightDp - 20f) + ROW_GAP.value) / rowHeightDp).toInt().coerceAtLeast(1)
+    // One row along the bottom. Fit as many apps as the screen width allows (newest on the
+    // left, "+" at the right end); older apps are dropped instead of scrolling.
+    val maxWidthDp = LocalConfiguration.current.screenWidthDp - 32f
+    val cellWidthDp = CELL.value + COL_GAP.value
+    val maxCells = (((maxWidthDp - 2 * BAR_PAD_H.value) + COL_GAP.value) / cellWidthDp).toInt().coerceAtLeast(1)
     val reservedForProgress = if (isOcrRunning) 1 else 0
-    val maxApps = ((maxRows - reservedForProgress) * COLUMNS - 1).coerceAtLeast(0) // keep one cell for "+"
+    val maxApps = (maxCells - reservedForProgress - 1).coerceAtLeast(0) // keep one cell for "+"
 
-    val cells: List<ShareTarget?> = recentTargets.take(maxApps) + listOf<ShareTarget?>(null) // null = "+"
-
-    Column(
+    Row(
         modifier = modifier
-            .clip(RailShape)
+            .clip(BarShape)
             .background(
-                Brush.verticalGradient(
+                Brush.horizontalGradient(
                     0f to Color(0x47D9D6D6),
                     0.5f to Color(0x66F5F3F8),
                     1f to Color(0x47D9D6D6)
                 )
             )
-            .border(1.dp, Color(0x33FFFFFF), RailShape)
-            .padding(horizontal = 8.dp, vertical = 10.dp)
+            .border(1.dp, Color(0x33FFFFFF), BarShape)
+            .padding(horizontal = BAR_PAD_H, vertical = 8.dp)
             .alpha(if (isReady) 1f else 0.5f)
             .testTag("share_rail"),
-        verticalArrangement = Arrangement.spacedBy(ROW_GAP),
-        horizontalAlignment = Alignment.CenterHorizontally
+        horizontalArrangement = Arrangement.spacedBy(COL_GAP),
+        verticalAlignment = Alignment.CenterVertically
     ) {
         if (isOcrRunning) {
             Box(Modifier.size(CELL), contentAlignment = Alignment.Center) {
@@ -88,19 +82,10 @@ fun CircleLensBottomBar(
                 )
             }
         }
-
-        cells.chunked(COLUMNS).forEach { row ->
-            Row(horizontalArrangement = Arrangement.spacedBy(COL_GAP)) {
-                row.forEach { target ->
-                    if (target == null) {
-                        NewAppCell(isReady, onShareEntireScreenGeneral)
-                    } else {
-                        AppCell(target, isReady) { onShareEntireScreenDirect(target) }
-                    }
-                }
-                if (row.size < COLUMNS) Spacer(Modifier.width(CELL))
-            }
+        recentTargets.take(maxApps).forEach { target ->
+            AppCell(target, isReady) { onShareEntireScreenDirect(target) }
         }
+        NewAppCell(isReady, onShareEntireScreenGeneral)
     }
 }
 
